@@ -2,8 +2,8 @@
 
 **RWA Outlets** is an instant-liquidity market for tokenized real-world assets, modeled on
 [Symbiotic Liquid Lane](https://symbiotic.fi/liquid-lane/) but rebuilt as a **1inch Aqua app with
-SwapVM programs**. Holders of tokenized RWAs exit to USDC in one transaction through risk-tiered
-pools, or queue for NAV settlement and keep the yield. A subgraph-driven AI curator agent manages
+SwapVM programs**. Holders of tokenized RWAs exit to USDC — or buy in — in one transaction through
+risk-tiered pools, or queue for NAV settlement and keep the yield. A subgraph-driven AI curator agent manages
 the pools, and a Uniswap v4 lane provides secondary-market pricing and fallback routing. Page 2
 (`02-engine-spec.md`) is the contract-level spec.
 
@@ -30,7 +30,7 @@ We keep the economics and replace the machinery with the hackathon stack:
 
 | Liquid Lane | RWA Outlets | Why |
 |---|---|---|
-| Offchain RFQ network of market makers | Deterministic onchain quotes from **SwapVM programs** (fixed spread / Dutch-decay auction) | No offchain quoting infra; quotes are verifiable and fork-testable |
+| Offchain RFQ network of market makers | Deterministic onchain quotes from **SwapVM programs** (fixed spread / Dutch-decay auction / xyc AMM) | No offchain quoting infra; quotes are verifiable and fork-testable |
 | Shared curator vaults holding deposits | **Aqua virtual balances** — capital stays in maker wallets, one approval backs many strategies | Aqua is natively "shared collateral"; zero deposit/withdraw code |
 | Idle capital parked in Aave/Morpho | **Aqua capital reuse** — the same wallet balance concurrently backs both pools and any other Aqua strategy | Same "productive between redemptions" property, enforced by the registry |
 | Institutional curators | **AI curator agent** reasoning over our live subgraph, every decision logged with its query + entities | The Graph prize track |
@@ -49,6 +49,7 @@ flowchart LR
     VM --> APP[OutletApp is an AquaApp]
     APP --> P1[[Pool 1 Express<br/>high-liquidity RWAs]]
     APP --> P2[[Pool 2 Patient<br/>intermediate risk]]
+    APP --> P3[[Pool 3 Market<br/>two-sided xyc AMM]]
     APP --- NAV[NavOracle]
     APP --- KYC[ComplianceRegistry]
   end
@@ -63,7 +64,9 @@ flowchart LR
 One `OutletApp` (an `AquaApp`), many **pools**. A pool is an Aqua *strategy* (`strategyHash`) with
 its own SwapVM program and risk parameters — pricing is isolated per pool, but the **capital is
 not**: a maker's single USDC approval backs every pool they ship to. That is the core trick Liquid
-Lane markets against "isolated liquidity pools", and Aqua gives it to us for free.
+Lane markets against "isolated liquidity pools", and Aqua gives it to us for free. Fixed-rate
+quotes, decay auctions, and xyc AMM curves are just different strategies drawing on the same
+shipped balance.
 
 ## 4. The pools — risk-tiered lanes over one shared capital base
 
@@ -79,6 +82,14 @@ For longer-dated / less liquid RWAs (private credit, 30–180 day issuer windows
 **Dutch-decay auction program**: the quoted discount starts tight and decays toward a floor until a
 maker-side fill clears, discovering the fair discount onchain (this replaces Liquid Lane's RFQ
 bidding). Typical clearing 50–300 bps below NAV.
+
+### Pool 3 — Market (two-sided xyc AMM)
+
+A constant-product `_xycSwapXD` strategy that quotes **both directions** — exits *and* entries
+(buying RWAs with USDC) — turning the outlets into a full market rather than an exit-only venue.
+Each maker's shipped virtual balances form their own self-custodial mini-pool under the shared
+strategy (Aqua's wallet-as-pool model); the router hits the best maker curve. No NAV oracle
+dependency, so it keeps quoting between NAV updates and for oracle-less assets.
 
 ### Delayed exit — RedemptionQueue ("wait and take the profit")
 
@@ -99,7 +110,8 @@ the makers who fund instant exits.
 
 ## 5. Yield — three streams, mirroring Liquid Lane
 
-1. **Redemption spreads** — every instant exit pays the pool's spread/discount to the filling maker.
+1. **Redemption spreads + AMM fees** — every instant exit pays the pool's spread/discount to the
+   filling maker; the two-sided Market pool earns swap fees on entries as well as exits.
 2. **Capital reuse** — Aqua virtual balances let the same USDC back Pool 1, Pool 2, and any other
    Aqua strategy simultaneously; utilization compounds instead of fragmenting.
 3. **NAV capture** — inventory acquired at a discount is pushed through the RedemptionQueue and
@@ -109,6 +121,6 @@ the makers who fund instant exits.
 
 | Sponsor | What in this design qualifies |
 |---|---|
-| 1inch ($5k Aqua track) | `OutletApp` extends `AquaApp`; two SwapVM programs + a **custom opcode set** (NAV-anchored rate, compliance gate) — custom instructions are explicitly scored higher |
+| 1inch ($5k Aqua track) | `OutletApp` extends `AquaApp`; three SwapVM programs (fixed-rate, decay auction, xyc AMM) + a **custom opcode set** (NAV-anchored rate, compliance gate) — custom instructions are explicitly scored higher |
 | The Graph (Best AI Use Case) | Curator agent's decisions (rebalance, settle, widen spreads) come exclusively from our live subgraph; the query → reasoning → action log is the demo evidence |
 | Uniswap | v4 RWA/USDC secondary lane built on a custom hook (`RWAGateHook`): compliance-gated transfers, TWAP sanity check on program quotes, router fallback venue |

@@ -27,7 +27,7 @@ reimplementing it).
   `balances[maker][app][strategyHash][token]`.
 - Orders are built with `MakerTraitsLib.build(...)` carrying the pool's program bytes and
   `useAquaInsteadOfSignature: true` — shipped liquidity replaces EIP-712 signatures, and the same
-  wallet balance backs Pool 1 and Pool 2 concurrently.
+  wallet balance backs all three pools concurrently.
 - `pull()`/`push()` are swap-time settlement **only** (never liquidity management). Taker payment is
   verified with `_safeCheckAquaPush()` behind a reentrancy guard.
 - Taker side always calls `quote()` via `asView()` with the *same* takerData later passed to
@@ -57,6 +57,23 @@ _requireMinRate1D(floorRate)             // hard floor = max discount a maker wi
 _invalidateBit1D()                       // one-shot fill for full-position redemption orders
 ```
 
+**Pool 3 — Market** (two-sided xyc AMM on Aqua-managed balances):
+
+```text
+_flatFeeAmountInXD(ammFee)               // swap fee, accrues to the maker's reserves
+_xycSwapXD()                             // constant product over the maker's virtual balances
+_requireMinRate1D(navBandFloor)          // optional: keep fills inside a NAV-derived band
+```
+
+No invalidators — the order is a standing curve: each fill moves the maker's virtual reserves and
+therefore the next price, exactly like an AMM pool, except the "pool" is the maker's wallet.
+
+**Isolated resting bids (optional maker mode).** Makers who want ring-fenced, order-scoped
+inventory at hand-picked discount levels — the closest analog to Liquid Lane's RFQ bids — sign
+EIP-712 SwapVM limit orders using `_staticBalancesXD` (fixed-rate) or `_dynamicBalancesXD`
+(isolated AMM) instead of Aqua-managed balances. Same program machinery, no `ship()` required;
+the router treats them as additional quote sources.
+
 Routing uses the official `AquaSwapVMRouter` for shipped-liquidity execution; `OutletVM` is only a
 superset (official opcodes + ours), satisfying the "official contracts" rule while hitting the
 "custom instructions" scoring bonus.
@@ -75,8 +92,10 @@ States: `Pending → SubmittedToIssuer → Settled → Claimed`.
 
 ## 5. Router + Uniswap lane
 
-`OutletRouter.redeemInstant(asset, amount, minOut)` quotes Pool 1, Pool 2, and the Uniswap v4
-RWA/USDC pool, executes the best (or reverts to `enqueue` if the user chose patient mode).
+`OutletRouter.redeemInstant(asset, amount, minOut)` quotes Pools 1–3, any isolated resting bids,
+and the Uniswap v4 RWA/USDC pool, then executes the best (or reverts to `enqueue` if the user chose
+patient mode). Because Pool 3 is two-sided, the router also exposes `buy(asset, usdcIn, minOut)` —
+entries route through the Market pool or Uniswap, whichever quotes better.
 Uniswap serves two jobs: **fallback venue** when Aqua inventory is thin, and **TWAP sanity bound** —
 program quotes deviating > `twapBandBps` from the v4 TWAP revert unless the NavOracle is fresher
 than the TWAP window. `RWAGateHook` enforces transfer compliance on the v4 pool, making the
@@ -90,7 +109,7 @@ and UI see only events. Per `graph-contracts-sync`, any event/ABI change regener
 
 | Event | Subgraph entity | Agent uses it for |
 |---|---|---|
-| `InstantRedemption(pool, asset, maker, taker, amountIn, usdcOut, discountBps)` | `Redemption` | Spread/volume monitoring, discount depth |
+| `Trade(pool, asset, direction, maker, taker, amountIn, amountOut, rateVsNavBps)` | `Trade` | Spread/volume monitoring, discount depth, AMM flow imbalance |
 | `LiquidityShipped/Docked(maker, strategyHash, token, amount)` | `MakerPosition` | Inventory + utilization per pool |
 | `Enqueued/Submitted/Settled/Claimed(id, asset, amount, nav)` | `QueueTicket` | Backlog aging, settlement triggers |
 | `NavUpdated(asset, nav, timestamp)` | `NavPoint` | Staleness alerts, rate anchoring |
@@ -103,13 +122,13 @@ demo evidence The Graph requires.
 
 ## 7. Parameters (initial)
 
-| Param | Pool 1 Express | Pool 2 Patient |
-|---|---|---|
-| Spread / discount | 5–25 bps fixed | decay 30 → 300 bps over 30 min |
-| Assets (demo) | `rwaTBILL` (T+7) | `rwaCREDIT` (T+90) |
-| Per-asset inventory cap | 500k USDC | 150k USDC |
-| NAV staleness max | 24h | 24h |
-| Queue fee | — | 5 bps |
+| Param | Pool 1 Express | Pool 2 Patient | Pool 3 Market |
+|---|---|---|---|
+| Pricing | NAV − 5–25 bps fixed | decay 30 → 300 bps over 30 min | xyc curve + 30 bps fee |
+| Assets (demo) | `rwaTBILL` (T+7) | `rwaCREDIT` (T+90) | both |
+| Per-asset inventory cap | 500k USDC | 150k USDC | maker-set shipped reserves |
+| NAV staleness max | 24h | 24h | n/a (optional NAV band) |
+| Queue fee | — | 5 bps | — |
 
 Demo assets are real contracts deployed to Base Sepolia with live keeper-updated NAV (no static
 fixtures); the 1inch demo runs on a mainnet fork against real tokenized T-bill tokens and the
@@ -128,7 +147,8 @@ official Aqua/SwapVM deployments.
 
 1. **M1** — `OutletApp` + Express program, fork test swapping a real RWA token through official
    Aqua/SwapVM (minimum 1inch qualification, runnable `script/Demo.s.sol`).
-2. **M2** — Patient pool (decay program) + custom opcodes (`OutletVM`) + `RedemptionQueue`.
+2. **M2** — Patient pool (decay program) + Market pool (xyc AMM) + custom opcodes (`OutletVM`) +
+   `RedemptionQueue`.
 3. **M3** — `OutletRouter` + Uniswap v4 pool with `RWAGateHook` (TWAP band + fallback); Base
    Sepolia deploy (`deployments/<chain>.json`).
 4. **M4** — Subgraph + curator agent with decision log.
