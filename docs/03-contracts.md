@@ -23,7 +23,7 @@ the official deployed 1inch stack — we only build what plugs into it.**
 | 5 | `RedemptionQueue` | ERC-7540/7575 async redemption vault (per asset) | M2 | ~280 | OZ ERC-4626 + 7540/7575 interfaces |
 | 6 | `RWAGateHook` | v4 hook: compliance gate + TWAP | M3 | ~200 | v4-periphery `BaseHook`, `ComplianceNFT` |
 | 7 | `OutletRouter` | Best-of execution across pools / bids / v4 | M3 | ~300 | swap-vm `ISwapVM`, `RWAGateHook`, `RedemptionQueue` |
-| 8 | `CuratorVault` | B2C USDC vault; curator creates mandate-bound pools | M3 | ~350 | OZ ERC-4626, 7540 interfaces, `IAqua`, `NavOracle`, `RedemptionQueue` |
+| 8 | `CuratorVault` + `TierShare` + `RWAPipe` | ERC-7575 multi-asset tier vault; curator creates mandate-bound pools | M3 | ~510 | OZ ERC-4626, 7540/7575 interfaces, `IAqua`, `NavOracle`, `RedemptionQueue` |
 
 Everything else in the repo is scripts (`Deploy.s.sol`, `Demo.s.sol`, NAV keeper) and the test
 harness (fork tests against mainnet Aqua/router, quote==swap invariant suite reusing swap-vm's
@@ -145,15 +145,22 @@ deviating > `twapBandBps` from `RWAGateHook.twap()` revert unless `NavOracle` is
 TWAP window. Gated assets rely on the program-level tx.origin NFT gate (§3 of the engine spec) plus
 token-level restrictions.
 
-### 2.8 `CuratorVault` (M3) — the B2C capital vault
+### 2.8 `CuratorVault` + `TierShare` + `RWAPipe` (M3) — the B2C capital vault
 
-ERC-4626 with an ERC-7540 async redeem side; one instance per curator mandate. Retail LPs deposit
-USDC and hold vault shares; the curator — operationally the AI agent — deploys that capital into
-pool strategies. This is Liquid Lane's curated-vault leg rebuilt on Aqua: the vault is simply a
-**contract maker** (`useAquaInsteadOfSignature` needs no EOA signature).
+An **ERC-7575 multi-asset vault per risk tier**: one shared LP token, one entry point per asset.
+The tier vault handles every mandate asset of its risk class and is itself the strategy creator on
+Aqua/SwapVM — a **contract maker** (`useAquaInsteadOfSignature` needs no EOA signature). This is
+Liquid Lane's curated-vault leg rebuilt on Aqua. Three contracts:
+
+**`TierShare`** (~70 LOC) — the LP token. ERC-20 + ERC-165 (7575 share id `0xf815c03d`),
+`vault(address asset)` reverse lookup, `VaultUpdate` events; minting restricted to registered
+entry points. Exists separately because 7575 entry points SHOULD NOT be ERC-20.
+
+**`CuratorVault`** (~350 LOC) — the USDC entry point and the brain; holds the tier treasury
+(USDC + RWA inventory).
 
 ```solidity
-// LP side
+// LP side (USDC entry point, ERC-7575: share() = TierShare, vault id 0x2f0a18c5)
 function deposit(uint256 assets, address receiver) external returns (uint256 shares);
                         // sync 4626 mint at NAV-based share price; reverts on stale NAV; optional ComplianceNFT gate
 function requestRedeem(uint256 shares, address controller, address owner) external returns (uint256 epoch);
@@ -168,10 +175,26 @@ function recycle(address asset, uint256 amount) external onlyCurator; // RWA inv
 function fulfillRedeemEpoch(uint256 epoch) external onlyCurator;      // moves freed USDC to Claimable for LP exits
 ```
 
+**`RWAPipe`** (~90 LOC, one per mandate asset) — unidirectional deposit-only 7575 entry point:
+
+```solidity
+function deposit(uint256 rwaAmount, address receiver) external returns (uint256 shares);
+                        // pulls the RWA into the CuratorVault treasury, mints TierShare at NavOracle value
+function share() external view returns (address);  // TierShare
+function asset() external view returns (address);  // the mandate RWA
+// no redeem/withdraw — per 7575, unidirectional pipes implement entry functions only
+```
+
+The pipe is the in-kind on-ramp: RWA holders convert exposure to diversified tier yield at **full
+NAV with zero spread**, and the vault acquires inventory paying in shares instead of USDC (it
+recycles the inventory through the queue at NAV). All exits go through the USDC entry point's
+epochs.
+
 `totalAssets()` = idle USDC + shipped Aqua balances (`rawBalances`) + RWA inventory and queue
-positions at `NavOracle` value. LP exits settle at realized values through epochs (no
-oracle-priced instant exit), which closes the classic 4626 stale-price arbitrage. Pro makers are
-unaffected — both maker classes ship the same order templates to the same official router.
+positions at `NavOracle` value — computed once across all entry points (7575's fix for share
+double-counting). LP exits settle at realized values through epochs (no oracle-priced instant
+exit), which closes the classic 4626 stale-price arbitrage. Pro makers are unaffected — both maker
+classes ship the same order templates to the same official router.
 
 ## 3. Build order
 

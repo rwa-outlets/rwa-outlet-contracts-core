@@ -17,7 +17,7 @@ allowed, never reimplementing it.
 | `NavExtruction` | `IExtruction`, `IStaticExtruction` | Our custom instruction, plugged in via the stock `_extruction` opcode: NAV-anchored spread (Pool 1), Dutch decay (Pool 2), NAV band check (Pool 3); stale-NAV revert; emits `Trade` during swaps |
 | `ComplianceNFT` | ERC-721 (soulbound) | KYC pass: mint/revoke by operator; checked onchain by stock balance-gate opcodes and by `RWAGateHook` |
 | `RedemptionQueue` | ERC-7540 + ERC-7575 (redemption-only vault per asset) | Escrows redemption requests by issuer epoch (`share()` = the RWA token, `asset()` = USDC); settlement flips epochs Claimable; standard `redeem()` pays NAV |
-| `CuratorVault` | ERC-4626 + ERC-7540 (async redeem) | B2C USDC vault: sync deposits, epoch-fulfilled LP exits; the curator (AI agent) creates/docks pools under a per-vault **asset mandate** and recycles inventory through the queue |
+| `CuratorVault` + `TierShare` + `RWAPipe` | ERC-7575 multi-asset vault; USDC entry = ERC-4626 + ERC-7540 | One vault per **risk tier**: shared `TierShare` LP token, sync USDC deposits + epoch-fulfilled exits, deposit-only RWA pipes (in-kind at NAV); the curator (AI agent) creates/docks mandate-bound pools and recycles inventory through the queue |
 | `OutletRouter` | — | Single user entry point: best-of quoting across Pools 1–3 / resting bids / Uniswap, and queue deposits |
 | `NavOracle` | — | Per-asset NAV pushed by issuer keeper (demo: agent-updated), with staleness bounds |
 | `RWAGateHook` | v4 `BaseHook` | Uniswap v4 hook: transfer compliance + TWAP exposure for the secondary lane |
@@ -145,25 +145,41 @@ external share — the vault mints nothing), `asset()` is USDC. Deposit side dis
 - Spread waterfall on maker-recycled inventory: maker keeps the NAV−discount capture minus
   `curatorFeeBps` (agent treasury) and `protocolFeeBps`.
 
-## 5. CuratorVault (B2C capital) — ERC-4626 + ERC-7540
+## 5. CuratorVault (B2C capital) — ERC-7575 multi-asset vault (ERC-4626 + ERC-7540)
 
-Where retail capital enters: a USDC vault per curator mandate, mirroring Liquid Lane's curated
-deposit vaults. Deposits are synchronous 4626 (`deposit()` mints shares at the NAV-based share
-price); LP exits are asynchronous 7540 (`requestRedeem` → curator frees capital → epoch turns
-Claimable) — the same single-sided async pattern as the `RedemptionQueue`.
+Where retail capital enters: one vault **per risk tier**, handling every mandate asset of that
+tier (Express tier = T-bill-class assets; Patient tier = private-credit assets). It follows the
+ERC-7575 multi-asset structure — one share token, multiple per-asset entry points (the spec's
+requirement that entry points not be ERC-20 is why the share is its own contract):
 
-- **Mandate** (immutable per vault): the set of RWA assets the vault may buy, per-asset caps,
-  maximum discount floor, fee split. `createPool(asset, poolType, params)` is curator-only and
-  reverts for out-of-mandate assets; it builds the pool order with `maker = vault`
-  (`NavExtruction` program per §3), approves Aqua, and `ship()`s vault USDC into the strategy.
+- **`TierShare`** — the LP token: ERC-20 + 7575 share interface (`0xf815c03d`), `vault(asset)`
+  reverse lookup and `VaultUpdate` events; minting restricted to registered entry points.
+- **`CuratorVault`** — the USDC entry point and the brain: synchronous 4626 `deposit()` at the
+  NAV-based share price, asynchronous ERC-7540 LP exits (`requestRedeem` → curator frees capital →
+  epoch turns Claimable, same single-sided pattern as the `RedemptionQueue`). Holds the tier
+  treasury (USDC + RWA inventory) and creates the tier's strategies on Aqua/SwapVM.
+- **`RWAPipe`** (one per mandate asset) — a unidirectional, deposit-only 7575 entry point (a
+  "pipe" in spec terms): deposit a mandate RWA, receive `TierShare` at `NavOracle` value. This is
+  in-kind purchasing — holders convert RWA exposure into diversified tier yield at **full NAV,
+  zero spread**, and the vault acquires inventory paying in shares instead of USDC. Exits go only
+  through the USDC entry point's epochs.
+
+Operation:
+
+- **Mandate** (immutable per vault): the tier's asset set, per-asset caps, maximum discount floor,
+  fee split. `createPool(asset, poolType, params)` is curator-only and reverts for out-of-mandate
+  assets; it builds the pool order with `maker = vault` (`NavExtruction` program per §3), approves
+  Aqua, and `ship()`s — the vault, not an EOA, is the strategy creator on Aqua/SwapVM.
 - **The curator is the AI agent.** Pool creation, rebalancing (dock + re-ship), recycling RWA
-  inventory bought at a discount into the `RedemptionQueue` (and auto-claiming at settlement via
-  the queue's operator model), and fulfilling LP exit epochs are all agent transactions — each
-  logged with its subgraph evidence for the Graph track.
+  inventory (bought at discount or piped in at NAV) into the `RedemptionQueue` (auto-claiming at
+  settlement via the queue's operator model), and fulfilling LP exit epochs are all agent
+  transactions — each logged with its subgraph evidence for the Graph track.
 - **totalAssets** = idle USDC + shipped Aqua balances (`rawBalances`) + RWA inventory and queue
-  positions valued at `NavOracle` (staleness-bounded; deposits revert on stale NAV).
-- Both maker classes coexist on one rail: pro makers ship their own wallets, vaults ship pooled
-  deposits — the pools are the same order templates either way.
+  positions valued at `NavOracle` (staleness-bounded; deposits revert on stale NAV) — computed
+  once across all entry points, which is exactly the share double-counting problem 7575 exists to
+  solve.
+- Both maker classes coexist on one rail: pro makers ship their own wallets, tier vaults ship
+  pooled deposits — the pools are the same order templates either way.
 
 ## 6. Router + Uniswap lane
 
@@ -189,7 +205,7 @@ the same commit series.
 | `Swapped(orderHash, maker, taker, tokenIn, tokenOut, amountIn, amountOut)` — official router | `Trade` | Pool 3 fills (no extruction context), AMM flow imbalance |
 | `Shipped/Docked/Pushed/Pulled(maker, app, strategyHash, token, amount)` — official Aqua | `MakerPosition` | Inventory + utilization per pool |
 | `RedeemRequest(controller, owner, epoch, sender, shares)` + `Submitted/Settled/Withdraw` — `RedemptionQueue` (ERC-7540) | `RedeemRequest` | Backlog aging, settlement triggers |
-| `Deposit/Withdraw` + `RedeemRequest` + `PoolCreated/PoolDocked(strategyHash, asset)` — `CuratorVault` | `VaultPosition`, `Pool` | LP flows, share-price history, mandate utilization |
+| `Deposit/Withdraw` + `RedeemRequest` + `PoolCreated/PoolDocked(strategyHash, asset)` + `VaultUpdate` — tier-vault entry points + `TierShare` | `VaultPosition`, `Pool` | LP flows (incl. in-kind pipe deposits), share-price history, mandate utilization |
 | `NavUpdated(asset, nav, timestamp)` — `NavOracle` | `NavPoint` | Staleness alerts, rate anchoring |
 
 **Curator agent loop** (Graph track): query subgraph (utilization, discount clearing levels, queue

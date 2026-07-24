@@ -31,7 +31,7 @@ We keep the economics and replace the machinery with the hackathon stack:
 | Liquid Lane | RWA Outlets | Why |
 |---|---|---|
 | Offchain RFQ network of market makers | Deterministic onchain quotes from **SwapVM programs** (fixed spread / Dutch-decay auction / xyc AMM) | No offchain quoting infra; quotes are verifiable and fork-testable |
-| Shared curator vaults holding deposits | **`CuratorVault`** — ERC-4626/7540 USDC vault (B2C: sync deposits, async LP exits) whose curator ships pooled capital into pool strategies under a per-vault **asset mandate**; pro makers can still ship their own wallets (B2B) | Same curated-deposit UX as Liquid Lane; Aqua virtual balances put both maker classes on one settlement rail |
+| Shared curator vaults holding deposits | **`CuratorVault`** — an ERC-7575 multi-asset vault per **risk tier** (one `TierShare` LP token; USDC entry = 4626 deposits + 7540 async exits; deposit-only pipes take any mandate RWA in-kind at NAV). The curator ships pooled capital into pool strategies under the tier mandate; pro makers can still ship their own wallets (B2B) | Same curated-deposit UX as Liquid Lane; Aqua virtual balances put both maker classes on one settlement rail |
 | Idle capital parked in Aave/Morpho | **Aqua capital reuse** — the same wallet balance concurrently backs both pools and any other Aqua strategy | Same "productive between redemptions" property, enforced by the registry |
 | Institutional curators | **AI curator agent** reasoning over our live subgraph, every decision logged with its query + entities | The Graph prize track |
 | Issuer-only settlement | Adds a **Uniswap v4 secondary lane** as price sanity check and fallback venue | Covers assets with real secondary markets |
@@ -56,7 +56,7 @@ How the components implement that loop:
 flowchart LR
   U[RWA holder] -->|instant exit| R[OutletRouter]
   U -->|patient exit| Q[RedemptionQueue<br/>ERC-7540 async vault]
-  LP[Retail LPs] -->|"deposit USDC (7540)"| CV[CuratorVault<br/>curator = AI agent,<br/>asset mandate]
+  LP[Retail LPs] -->|"deposit USDC — or any<br/>mandate RWA in-kind (7575 pipes)"| CV[CuratorVault per risk tier<br/>ERC-7575 · TierShare<br/>curator = AI agent]
   CV -->|"ship()"| AQ[(1inch Aqua<br/>virtual balances)]
   M[Pro makers<br/>capital stays in wallet] -->|"ship()"| AQ
 
@@ -85,12 +85,15 @@ gives it to us for free. Fixed-rate quotes, decay auctions, and xyc AMM curves a
 programs drawing on the same shipped balance — custom pricing plugs in through the official
 `_extruction` opcode (`NavExtruction`), and KYC is a stock NFT balance-gate opcode.
 
-Capital reaches the pools from **two maker classes on the same rail**. Retail LPs deposit USDC
-into a `CuratorVault` (B2C — deposits are plain 4626, exits are async ERC-7540 epochs); its
-curator, here the AI agent, creates pools restricted to the vault's **asset mandate** (e.g.
-"T-bill funds only, discount floor ≤ 300 bps") and ships vault capital into them. Pro makers
-(B2B) skip the vault and ship their own wallet balances directly. Aqua treats both identically —
-contract makers work because shipped liquidity replaces signatures.
+Capital reaches the pools from **two maker classes on the same rail**. Retail LPs enter a
+`CuratorVault` — one ERC-7575 multi-asset vault per **risk tier**, all entry points minting the
+same `TierShare`: deposit USDC (plain 4626), or pipe in any mandate RWA in-kind at full NAV, zero
+spread (deposit-only 7575 pipes — the vault buys inventory paying in shares). Exits are async
+ERC-7540 epochs. The vault's curator, here the AI agent, creates pools restricted to the tier
+mandate (e.g. "T-bill funds only, discount floor ≤ 300 bps") and ships vault capital into them —
+the vault itself is the strategy creator on Aqua/SwapVM. Pro makers (B2B) skip the vault and ship
+their own wallet balances directly. Aqua treats both identically — contract makers work because
+shipped liquidity replaces signatures.
 
 ## 4. The pools — risk-tiered lanes over one shared capital base
 
