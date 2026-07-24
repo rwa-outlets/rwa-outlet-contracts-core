@@ -1,82 +1,122 @@
 # RWA Outlets — Engine spec (page 2 of 2)
 
 Contract-level spec for the engine described in `01-architecture.md`. Stack: Foundry, Solidity
-^0.8.24, official 1inch contracts via `forge install 1inch/aqua 1inch/swap-vm` (mainnet: Aqua
-`0x499943e74fb0ce105688beee8ef2abec5d936d31`, SwapVM `0x8fdd04dbf6111437b44bbca99c28882434e0958f`
-— used directly in fork tests/demo; redeploying official code to Base Sepolia is allowed, never
-reimplementing it).
+^0.8.24, official 1inch contracts via `forge install 1inch/aqua 1inch/swap-vm`, **used as deployed,
+no VM fork**: Aqua `0x499943e74fb0ce105688beee8ef2abec5d936d31` and SwapVM
+`0x8fdd04dbf6111437b44bbca99c28882434e0958f` (unified address on 12 chains incl. Base; verified
+onchain as `AquaSwapVMRouter` = SwapVM core + `AquaOpcodes` instruction set). Custom logic enters
+only through the official `_extruction` opcode. Redeploying official code to Base Sepolia is
+allowed, never reimplementing it.
 
 ## 1. Contract map
 
 | Contract | Inherits | Role |
 |---|---|---|
-| `OutletApp` | `AquaApp` | The Aqua app. Holds pool strategies, verifies taker payment (`_safeCheckAquaPush()` + `nonReentrant`), emits all engine events |
-| `OutletVM` | `SwapVM` + `OutletOpcodes` | Official SwapVM extended with our instruction set via `_instructions()` override |
-| `OutletOpcodes` | — | Custom instructions: `_navAnchorRate` (quote from NavOracle, revert if stale) and `_complianceGate` (allowlist check for gated RWAs) |
+| `AquaSwapVMRouter` | — (official, deployed) | The VM **and** the Aqua app: runs pool programs, seeds registers from shipped balances, settles `pull()`/`push()` and verifies taker payment behind a per-order reentrancy lock. Used as-is at `0x8fdd…958f` |
+| `Aqua` | — (official, deployed) | Shared virtual balances: `ship`/`dock` (liquidity), `pull`/`push` (swap-time settlement) |
+| `NavExtruction` | `IExtruction`, `IStaticExtruction` | Our custom instruction, plugged in via the stock `_extruction` opcode: NAV-anchored spread (Pool 1), Dutch decay (Pool 2), NAV band check (Pool 3); stale-NAV revert; emits `Trade` during swaps |
+| `ComplianceNFT` | ERC-721 (soulbound) | KYC pass: mint/revoke by operator; checked onchain by stock balance-gate opcodes and by `RWAGateHook` |
 | `RedemptionQueue` | ERC-721 | Escrows RWA tokens, mints claim NFTs, pays NAV on issuer settlement |
-| `OutletRouter` | — | Single user entry point: best-of quoting across Pool 1 / Pool 2 / Uniswap, and queue deposits |
+| `OutletRouter` | — | Single user entry point: best-of quoting across Pools 1–3 / resting bids / Uniswap, and queue deposits |
 | `NavOracle` | — | Per-asset NAV pushed by issuer keeper (demo: agent-updated), with staleness bounds |
-| `ComplianceRegistry` | — | KYC'd maker allowlist (mirrors Liquid Lane's verified market makers); per-asset taker gating |
 | `RWAGateHook` | v4 `BaseHook` | Uniswap v4 hook: transfer compliance + TWAP exposure for the secondary lane |
 
 ## 2. Aqua integration (shared capital base)
 
-- Maker lifecycle: one USDC approval to Aqua → `aqua.ship(app, strategy, tokens, amounts)` per pool
-  they want to back → `dock()` to exit. Strategy bytes encode `(pool id, asset, params)`, so
-  `strategyHash` identifies **pool × asset**. Balances live at
-  `balances[maker][app][strategyHash][token]`.
-- Orders are built with `MakerTraitsLib.build(...)` carrying the pool's program bytes and
-  `useAquaInsteadOfSignature: true` — shipped liquidity replaces EIP-712 signatures, and the same
-  wallet balance backs all three pools concurrently.
-- `pull()`/`push()` are swap-time settlement **only** (never liquidity management). Taker payment is
-  verified with `_safeCheckAquaPush()` behind a reentrancy guard.
+The official router is itself the Aqua app — no app contract of ours sits in the swap path.
+
+- A **pool** is an order template: `MakerTraitsLib.build(...)` carries the pool's program bytes and
+  `useAquaInsteadOfSignature: true` (shipped liquidity replaces EIP-712 signatures). Per maker ×
+  asset, `strategy = abi.encode(order)` and `aqua.ship(swapVM, strategy, [rwa, usdc], amounts)`;
+  `strategyHash == orderHash == keccak256(strategy)`, balances live at
+  `balances[maker][swapVM][orderHash][token]`.
+- At swap time the router seeds the VM registers from `AQUA.safeBalances(...)`, settles maker→taker
+  via `pull()`, and verifies the taker's payment (direct `push()` or transferFrom-then-push) behind
+  a per-order reentrancy lock — all inside the official contract.
+- Shared capital: the same wallet USDC backs every pool strategy a maker ships (and any other Aqua
+  app). Fills are hard-capped by shipped balances, so **no invalidators are needed**; cancel =
+  `dock()`.
+- Strategies are immutable (`StrategiesMustBeImmutable`): changing pool params = dock + ship a new
+  order. NAV movement does *not* require re-shipping — programs read NAV live via `NavExtruction`.
 - Taker side always calls `quote()` via `asView()` with the *same* takerData later passed to
   `swap()`, plus threshold and deadline.
 
 ## 3. SwapVM programs (instruction order is security-critical)
 
-Composed with `ProgramBuilder`; order follows balances → fees → swap → invalidators.
+Everything runs on the deployed `AquaSwapVMRouter`. Its `AquaOpcodes` set (verified against
+`main`): control flow (`_jump`, `_jumpIfTokenIn/Out`, `_deadline`, `_salt`), taker gates
+(`_onlyTakerTokenBalanceNonZero`/`Gte`, `_onlyTakerTokenSupplyShareGte`,
+`_onlyTxOriginTokenBalanceNonZero`), pricing (`_xycSwapXD`, `_xycConcentrateGrowLiquidity2D`,
+`_peggedSwapGrowPriceRange2D`), MEV protection (`_decayXD` — Mooniswap-style virtual-balance decay,
+**not** a Dutch auction), fees (`_flatFeeAmountInXD`, `_protocolFeeAmountInXD` + Aqua/dynamic
+variants), and the extension hook `_extruction`.
 
-**Pool 1 — Express** (Aqua manages balances, so no balance instruction):
+*Not* in the deployed set: `_limitSwap1D`, `_requireMinRate1D`, `_dutchAuctionBalanceIn/Out1D`,
+`_staticBalancesXD`/`_dynamicBalancesXD`, invalidators, whitelists, TWAP — those live in the
+`Opcodes`/`LimitOpcodes` router flavors, which 1inch has not deployed. We don't need them; if that
+changes, deploying the official `LimitSwapVMRouter` bytecode is permitted.
 
-```text
-_flatFeeAmountInXD(protocolFee)          // fee taken before pricing
-_navAnchorRate(asset, spreadBps)         // custom opcode: rate = NAV × (1 − spread), stale-NAV revert
-_limitSwap1D(rate)                       // fill at the anchored rate
-_requireMinRate1D(minRate)               // taker slippage floor
-_invalidateTokenOut1D()                  // partial fills, capped by shipped inventory
-```
+Aqua strategies need no balance instruction (registers come from shipped balances). Order within a
+program: gates → fees → pricing.
 
-**Pool 2 — Patient** (Dutch-decay auction replaces RFQ bidding):
-
-```text
-_flatFeeAmountInXD(protocolFee)
-_complianceGate(asset)                   // custom opcode: gated RWAs check taker/maker allowlist
-_decayXD(startRate → floorRate, T)       // discount decays from tight to floor until filled
-_requireMinRate1D(floorRate)             // hard floor = max discount a maker will fund
-_invalidateBit1D()                       // one-shot fill for full-position redemption orders
-```
-
-**Pool 3 — Market** (two-sided xyc AMM on Aqua-managed balances):
+**Pool 1 — Express** (fixed NAV-anchored spread):
 
 ```text
-_flatFeeAmountInXD(ammFee)               // swap fee, accrues to the maker's reserves
-_xycSwapXD()                             // constant product over the maker's virtual balances
-_requireMinRate1D(navBandFloor)          // optional: keep fills inside a NAV-derived band
+_onlyTakerTokenBalanceNonZero(complianceNFT)   // stock KYC gate — "NFTs are natively supported"
+_flatFeeAmountInXD(protocolFeeBps)             // fee taken before pricing
+_extruction(navExtruction, (asset, spreadBps, maxStaleness))
+                                               // amounts at NAV × (1 − spread); stale NAV reverts
 ```
 
-No invalidators — the order is a standing curve: each fill moves the maker's virtual reserves and
-therefore the next price, exactly like an AMM pool, except the "pool" is the maker's wallet.
+**Pool 2 — Patient** (Dutch decay replaces RFQ bidding):
 
-**Isolated resting bids (optional maker mode).** Makers who want ring-fenced, order-scoped
-inventory at hand-picked discount levels — the closest analog to Liquid Lane's RFQ bids — sign
-EIP-712 SwapVM limit orders using `_staticBalancesXD` (fixed-rate) or `_dynamicBalancesXD`
-(isolated AMM) instead of Aqua-managed balances. Same program machinery, no `ship()` required;
-the router treats them as additional quote sources.
+```text
+_onlyTakerTokenBalanceNonZero(complianceNFT)
+_flatFeeAmountInXD(protocolFeeBps)
+_extruction(navExtruction, (asset, startBps, floorBps, startTime, duration))
+                                               // discount decays to the floor; expiry reverts
+```
 
-Routing uses the official `AquaSwapVMRouter` for shipped-liquidity execution; `OutletVM` is only a
-superset (official opcodes + ours), satisfying the "official contracts" rule while hitting the
-"custom instructions" scoring bonus.
+**Pool 3 — Market** (two-sided xyc AMM):
+
+```text
+_flatFeeAmountInXD(ammFeeBps)                  // swap fee, accrues to the maker's reserves
+_decayXD(decayPeriod)                          // optional stock MEV shield (virtual-reserve restoration)
+_xycSwapXD()                                   // constant product over shipped balances
+_extruction(navExtruction, (asset, bandBps))   // optional post-check: fill must sit inside NAV band
+```
+
+The Pool 3 order is a standing curve: each fill moves the maker's shipped reserves and therefore
+the next price, exactly like an AMM pool, except the "pool" is the maker's wallet.
+
+### NavExtruction — custom instruction without a VM fork
+
+`NavExtruction` implements the official `IExtruction` (swap) and `IStaticExtruction` (quote)
+interfaces and is invoked by the stock `_extruction` opcode, so custom pricing runs on the
+untouched official router. Constraints inherited from the official spec: deterministic, the
+quote/swap duals must return identical amounts, no backward jumps to it, contract immutable. Modes
+selected by args: fixed NAV spread, Dutch decay (exponential per-second factor, mirroring the
+official `DutchAuction` math, with hard floor and expiry), NAV band post-check. Reads `NavOracle`
+and reverts on staleness; in swap mode it also emits the `Trade` event with full pricing context
+(§6).
+
+### KYC — a soulbound NFT, not a registry
+
+`ComplianceNFT` is a non-transferable ERC-721 minted/revoked per KYC'd address. Programs gate on it
+with stock opcodes: `_onlyTakerTokenBalanceNonZero` when the user fills directly,
+`_onlyTxOriginTokenBalanceNonZero` when the fill routes through `OutletRouter` (taker = router).
+The tx.origin variant is documented as weak (interceptable flows, breaks smart-wallet users) — an
+acceptable gate for a discount venue, since the hard compliance line stays at the RWA token itself
+and at `RWAGateHook` on v4. Maker-side verification mirrors Liquid Lane: shipping makers hold the
+same NFT, checked by the curator agent.
+
+### Isolated resting bids (optional maker mode)
+
+Because `strategyHash == orderHash`, every shipped order is already **order-scoped**: shipping a
+small dedicated strategy — fixed-rate `NavExtruction` program + `_deadline`, funded with exactly
+the bid size — is a ring-fenced resting bid at a hand-picked discount, the closest analog to
+Liquid Lane's RFQ bids. No signatures, no extra router; `OutletRouter` treats these as additional
+quote sources.
 
 ## 4. RedemptionQueue (delayed lane)
 
@@ -103,16 +143,18 @@ secondary lane a first-class integration alongside Aqua/SwapVM and the subgraph.
 
 ## 6. Events → subgraph → agent (data flows one way)
 
-Every state change emits full context (tokens, amounts, maker/taker, strategyHash) — the subgraph
-and UI see only events. Per `graph-contracts-sync`, any event/ABI change regenerates
-`subgraph/abis` + `front/src/lib/abi` in the same commit series.
+Every state change emits full context — from the official contracts (Aqua, the SwapVM router) and
+from ours (`NavExtruction`, queue, oracle); the subgraph and UI see only events. Per
+`graph-contracts-sync`, any event/ABI change regenerates `subgraph/abis` + `front/src/lib/abi` in
+the same commit series.
 
-| Event | Subgraph entity | Agent uses it for |
+| Event (emitter) | Subgraph entity | Agent uses it for |
 |---|---|---|
-| `Trade(pool, asset, direction, maker, taker, amountIn, amountOut, rateVsNavBps)` | `Trade` | Spread/volume monitoring, discount depth, AMM flow imbalance |
-| `LiquidityShipped/Docked(maker, strategyHash, token, amount)` | `MakerPosition` | Inventory + utilization per pool |
-| `Enqueued/Submitted/Settled/Claimed(id, asset, amount, nav)` | `QueueTicket` | Backlog aging, settlement triggers |
-| `NavUpdated(asset, nav, timestamp)` | `NavPoint` | Staleness alerts, rate anchoring |
+| `Trade(pool, asset, direction, maker, taker, amountIn, amountOut, rateVsNavBps)` — `NavExtruction` | `Trade` | Spread/volume monitoring, discount depth |
+| `Swapped(orderHash, maker, taker, tokenIn, tokenOut, amountIn, amountOut)` — official router | `Trade` | Pool 3 fills (no extruction context), AMM flow imbalance |
+| `Shipped/Docked/Pushed/Pulled(maker, app, strategyHash, token, amount)` — official Aqua | `MakerPosition` | Inventory + utilization per pool |
+| `Enqueued/Submitted/Settled/Claimed(id, asset, amount, nav)` — `RedemptionQueue` | `QueueTicket` | Backlog aging, settlement triggers |
+| `NavUpdated(asset, nav, timestamp)` — `NavOracle` | `NavPoint` | Staleness alerts, rate anchoring |
 
 **Curator agent loop** (Graph track): query subgraph (utilization, discount clearing levels, queue
 backlog, NAV staleness) → reason against policy (e.g. "Pool 2 clearing > 250 bps for 6h → raise
@@ -136,18 +178,21 @@ official Aqua/SwapVM deployments.
 
 ## 8. Invariants & risks
 
-- `quote() == swap()` for identical takerData (tested with swap-vm `OpcodesDebug` + `CoreInvariants`:
-  quote/swap consistency, partial fills, invalidation).
-- No `pull()/push()` outside swap execution; checks-effects-interactions everywhere.
+- `quote() == swap()` for identical takerData (tested with swap-vm `AquaOpcodesDebug`), including
+  the `NavExtruction` static/state duals — the official Extruction contract requires deterministic,
+  identical results in both modes and forbids backward jumps to it.
+- Swap-path safety (per-order reentrancy lock, taker-push verification, `pull()`/`push()` only at
+  settlement) is enforced inside the official router — not our code, not our audit surface.
 - Stale/manipulated NAV is the main oracle risk → hard staleness revert + Uniswap TWAP band.
 - Queue solvency is structural (pay only from received settlement); RWA depeg risk sits with makers
   who priced it, never with queue depositors.
 
 ## 9. Milestones
 
-1. **M1** — `OutletApp` + Express program, fork test swapping a real RWA token through official
-   Aqua/SwapVM (minimum 1inch qualification, runnable `script/Demo.s.sol`).
-2. **M2** — Patient pool (decay program) + Market pool (xyc AMM) + custom opcodes (`OutletVM`) +
+1. **M1** — Express pool end-to-end: `NavOracle` + `NavExtruction` (fixed-spread mode) +
+   `ComplianceNFT`, fork test swapping a real RWA token through the **deployed** official
+   Aqua + `AquaSwapVMRouter` (minimum 1inch qualification, runnable `script/Demo.s.sol`).
+2. **M2** — Patient pool (decay mode) + Market pool (xyc AMM + NAV band) + isolated resting bids +
    `RedemptionQueue`.
 3. **M3** — `OutletRouter` + Uniswap v4 pool with `RWAGateHook` (TWAP band + fallback); Base
    Sepolia deploy (`deployments/<chain>.json`).

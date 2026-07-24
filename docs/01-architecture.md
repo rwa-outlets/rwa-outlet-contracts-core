@@ -59,28 +59,29 @@ flowchart LR
   M[Makers / LPs<br/>capital stays in wallet] -->|"ship()"| AQ[(1inch Aqua<br/>virtual balances)]
 
   subgraph ENGINE[RWA Outlets engine]
-    R --> VM[1inch SwapVM<br/>+ Outlet opcodes]
-    VM --> APP[OutletApp is an AquaApp]
-    APP --> P1[[Pool 1 Express<br/>high-liquidity RWAs]]
-    APP --> P2[[Pool 2 Patient<br/>intermediate risk]]
-    APP --> P3[[Pool 3 Market<br/>two-sided xyc AMM]]
-    APP --- NAV[NavOracle]
-    APP --- KYC[ComplianceRegistry]
+    R --> VM[official 1inch SwapVM<br/>AquaSwapVMRouter, used as-is]
+    VM --> P1[[Pool 1 Express<br/>high-liquidity RWAs]]
+    VM --> P2[[Pool 2 Patient<br/>intermediate risk]]
+    VM --> P3[[Pool 3 Market<br/>two-sided xyc AMM]]
+    VM --> EXT[NavExtruction<br/>custom pricing instruction]
+    EXT --- NAV[NavOracle]
+    VM --- KYC[ComplianceNFT gate]
   end
 
-  APP <-->|"pull()/push()"| AQ
+  VM <-->|"pull()/push()"| AQ
   Q -->|settle at NAV| ISS[Issuer redemption]
   R -.->|fallback + TWAP check| UNI[Uniswap v4 RWA/USDC]
   ENGINE -->|events| SG[Graph subgraph] --> AGENT[AI curator agent]
   AGENT -->|rebalance, trigger settlement| ENGINE
 ```
 
-One `OutletApp` (an `AquaApp`), many **pools**. A pool is an Aqua *strategy* (`strategyHash`) with
-its own SwapVM program and risk parameters — pricing is isolated per pool, but the **capital is
-not**: a maker's single USDC approval backs every pool they ship to. That is the core trick Liquid
-Lane markets against "isolated liquidity pools", and Aqua gives it to us for free. Fixed-rate
-quotes, decay auctions, and xyc AMM curves are just different strategies drawing on the same
-shipped balance.
+The **official deployed router is the Aqua app** — we fork nothing. A pool is an Aqua *strategy*
+(`strategyHash`): an order template with its own SwapVM program and risk parameters — pricing is
+isolated per pool, but the **capital is not**: a maker's single USDC approval backs every pool they
+ship to. That is the core trick Liquid Lane markets against "isolated liquidity pools", and Aqua
+gives it to us for free. Fixed-rate quotes, decay auctions, and xyc AMM curves are just different
+programs drawing on the same shipped balance — custom pricing plugs in through the official
+`_extruction` opcode (`NavExtruction`), and KYC is a stock NFT balance-gate opcode.
 
 ## 4. The pools — risk-tiered lanes over one shared capital base
 
@@ -135,6 +136,6 @@ the makers who fund instant exits.
 
 | Sponsor | What in this design qualifies |
 |---|---|
-| 1inch ($5k Aqua track) | `OutletApp` extends `AquaApp`; three SwapVM programs (fixed-rate, decay auction, xyc AMM) + a **custom opcode set** (NAV-anchored rate, compliance gate) — custom instructions are explicitly scored higher |
+| 1inch ($5k Aqua track) | Runs on the **untouched official deployments** (Aqua + `AquaSwapVMRouter`); three SwapVM programs (fixed NAV spread, Dutch decay, xyc AMM) with pricing injected through the official `_extruction` opcode (`NavExtruction`) — custom-instruction logic with no VM fork — plus stock NFT balance-gate opcodes for compliance |
 | The Graph (Best AI Use Case) | Curator agent's decisions (rebalance, settle, widen spreads) come exclusively from our live subgraph; the query → reasoning → action log is the demo evidence |
 | Uniswap | v4 RWA/USDC secondary lane built on a custom hook (`RWAGateHook`): compliance-gated transfers, TWAP sanity check on program quotes, router fallback venue |
