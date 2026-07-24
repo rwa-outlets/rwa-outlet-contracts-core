@@ -1,4 +1,4 @@
-# RWA Outlets — Architecture (page 1 of 2)
+# RWA Outlets — Architecture (page 1 of 3)
 
 **RWA Outlets** is an instant-liquidity market for tokenized real-world assets, modeled on
 [Symbiotic Liquid Lane](https://symbiotic.fi/liquid-lane/) but rebuilt as a **1inch Aqua app with
