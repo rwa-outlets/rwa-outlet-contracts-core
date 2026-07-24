@@ -38,6 +38,20 @@ We keep the economics and replace the machinery with the hackathon stack:
 
 ## 3. System overview
 
+The engine in one circle — every pool runs this capital cycle continuously:
+
+```mermaid
+flowchart TD
+  BUY["1 — Purchase<br/>pool buys the RWA below NAV;<br/>the exiting holder gets instant USDC"]
+  REDEEM["2 — Redeem<br/>pool pushes the RWA through the<br/>RedemptionQueue and settles with the issuer at full NAV"]
+  RECYCLE["3 — Recycle<br/>USDC is back in the pool, ready to purchase again —<br/>plus profit ≈ NAV − purchase price"]
+  BUY --> REDEEM
+  REDEEM --> RECYCLE
+  RECYCLE -->|repeat| BUY
+```
+
+How the components implement that loop:
+
 ```mermaid
 flowchart LR
   U[RWA holder] -->|instant exit| R[OutletRouter]
