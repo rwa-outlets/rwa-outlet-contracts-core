@@ -12,7 +12,7 @@ the official deployed 1inch stack — we only build what plugs into it.**
 | Uniswap v4 `PoolManager` | Canonical deployments on target chains |
 | `OutletApp`, `OutletVM`, `OutletOpcodes`, `ComplianceRegistry` | Cut from the design — replaced by the official router, `NavExtruction`, and `ComplianceNFT` |
 
-## 1. Build list (7 contracts)
+## 1. Build list (8 contracts)
 
 | # | Contract | One-liner | Milestone | Est. LOC | Depends on |
 |---|---|---|---|---|---|
@@ -20,9 +20,10 @@ the official deployed 1inch stack — we only build what plugs into it.**
 | 2 | `ComplianceNFT` | Soulbound ERC-721 KYC pass | M1 | ~60 | OZ ERC-721 |
 | 3 | `NavExtruction` | Custom pricing instruction (all 3 pool modes) | M1 (fixed) / M2 (decay, band) | ~250 | swap-vm interfaces, `NavOracle` |
 | 4 | `RWAToken` + `TestUSDC` | Demo assets (18d RWA, 6d USDC) | M1 | ~110 | OZ ERC-20 |
-| 5 | `RedemptionQueue` | Claim-NFT escrow, NAV settlement | M2 | ~200 | OZ ERC-721, `NavOracle` |
+| 5 | `RedemptionQueue` | ERC-7540/7575 async redemption vault (per asset) | M2 | ~280 | OZ ERC-4626 + 7540/7575 interfaces |
 | 6 | `RWAGateHook` | v4 hook: compliance gate + TWAP | M3 | ~200 | v4-periphery `BaseHook`, `ComplianceNFT` |
 | 7 | `OutletRouter` | Best-of execution across pools / bids / v4 | M3 | ~300 | swap-vm `ISwapVM`, `RWAGateHook`, `RedemptionQueue` |
+| 8 | `CuratorVault` | B2C USDC vault; curator creates mandate-bound pools | M3 | ~350 | OZ ERC-4626, 7540 interfaces, `IAqua`, `NavOracle`, `RedemptionQueue` |
 
 Everything else in the repo is scripts (`Deploy.s.sol`, `Demo.s.sol`, NAV keeper) and the test
 harness (fork tests against mainnet Aqua/router, quote==swap invariant suite reusing swap-vm's
@@ -88,19 +89,34 @@ Must handle: exactIn and exactOut, both trade directions, decimal scaling (RWA 1
 (T+7), `rwaCREDIT` (T+90). `TestUSDC`: 6-decimals mintable ERC-20 for Base Sepolia only (fork demo
 uses real USDC).
 
-### 2.5 `RedemptionQueue` (M2)
+### 2.5 `RedemptionQueue` (M2) — ERC-7540 + ERC-7575
 
-ERC-721 claim tickets over escrowed RWA. States `Pending → SubmittedToIssuer → Settled → Claimed`.
-Solvency is structural: `claim` pays only out of settlement cash received.
+An **asynchronous redemption-only vault, one instance per RWA asset** — ERC-7540 is the standard
+built for exactly this (issuer-delayed RWA redemptions; Centrifuge lineage). ERC-7575 shape: the
+vault mints nothing — `share()` returns the RWA token itself (external share), `asset()` is USDC.
+Deposit side disabled (`maxDeposit == 0`, `deposit`/`mint` revert); 7540 permits single-sided async
+vaults. `requestId` = **issuer batch epoch**, so a whole window settles at one NAV.
 
 ```solidity
-function enqueue(address asset, uint256 amount) external returns (uint256 id); // mints ticket (asset, amount, navAtEnqueue)
-function submitToIssuer(address asset, uint256[] calldata ids) external onlyCurator;
-function settle(address asset, uint256 navAtSettle1e18) external onlyIssuer;   // pulls USDC in
-function claim(uint256 id) external;                                           // amount × navAtSettle − queueFee
-event Enqueued(uint256 id, address asset, uint256 amount, uint256 nav);
-event Submitted(uint256 id); event Settled(address asset, uint256 nav); event Claimed(uint256 id, uint256 payout);
+// standard ERC-7540 surface
+function requestRedeem(uint256 shares, address controller, address owner) external returns (uint256 epoch);
+function pendingRedeemRequest(uint256 epoch, address controller) external view returns (uint256 shares);
+function claimableRedeemRequest(uint256 epoch, address controller) external view returns (uint256 shares);
+function setOperator(address operator, bool approved) external;   // holders authorize the curator agent once
+function share() external view returns (address);                 // ERC-7575: the RWA token
+function redeem(uint256 shares, address receiver, address controller) external returns (uint256 assets);
+                                                                   // 4626 claim leg: shares × navAtSettle − queueFee, FIFO epochs
+// ours
+function submitToIssuer(uint256 epoch) external onlyCurator;               // batch → issuer window (stays Pending)
+function settle(uint256 epoch, uint256 navAtSettle1e18) external onlyIssuer; // pulls USDC in, epoch → Claimable
 ```
+
+Conformance notes: `previewRedeem`/`previewWithdraw` MUST revert (async flows), the Claimable
+state must be observable (never skipped), `maxRedeem(controller)` = claimable shares, standard
+`RedeemRequest`/`OperatorSet`/`Withdraw` events. Solvency is structural: claims pay only out of
+settlement cash received. The operator model doubles as the agent story — the curator auto-claims
+for users when epochs settle. (OZ community-contracts has an `ERC7540` base, but it assumes
+vault-minted shares; our external-share shape means we write the request book ourselves.)
 
 ### 2.6 `RWAGateHook` (M3)
 
@@ -117,7 +133,10 @@ Single user entry point; holds no funds, only routes.
 function registerStrategy(ISwapVM.Order calldata order) external;   // curator/maker lists a pool or resting bid
 function redeemInstant(address asset, uint256 amount, uint256 minOut) external returns (uint256 usdcOut);
 function buy(address asset, uint256 usdcIn, uint256 minOut) external returns (uint256 rwaOut);
-function enqueue(address asset, uint256 amount) external returns (uint256 ticketId); // passthrough
+function enqueue(address asset, uint256 amount) external returns (uint256 epoch);
+// patient mode: forwards to the asset's queue requestRedeem(amount, user, user) —
+// requires the user to have approved the RWA to the queue and set the router as ERC-7540 operator
+// (or the user calls the queue directly; the router call is just UX sugar)
 ```
 
 Quoting: `swapVM.asView().quote(...)` over registered strategies (same takerData reused for
@@ -126,6 +145,34 @@ deviating > `twapBandBps` from `RWAGateHook.twap()` revert unless `NavOracle` is
 TWAP window. Gated assets rely on the program-level tx.origin NFT gate (§3 of the engine spec) plus
 token-level restrictions.
 
+### 2.8 `CuratorVault` (M3) — the B2C capital vault
+
+ERC-4626 with an ERC-7540 async redeem side; one instance per curator mandate. Retail LPs deposit
+USDC and hold vault shares; the curator — operationally the AI agent — deploys that capital into
+pool strategies. This is Liquid Lane's curated-vault leg rebuilt on Aqua: the vault is simply a
+**contract maker** (`useAquaInsteadOfSignature` needs no EOA signature).
+
+```solidity
+// LP side
+function deposit(uint256 assets, address receiver) external returns (uint256 shares);
+                        // sync 4626 mint at NAV-based share price; reverts on stale NAV; optional ComplianceNFT gate
+function requestRedeem(uint256 shares, address controller, address owner) external returns (uint256 epoch);
+                        // async 7540 exit; curator frees capital, then epoch → Claimable → redeem()
+
+// curator side (the agent)
+struct Mandate { address[] allowedAssets; uint256 perAssetCap; uint16 maxDiscountFloorBps; uint16 curatorFeeBps; }
+function createPool(address asset, PoolType kind, bytes calldata params) external onlyCurator returns (bytes32 strategyHash);
+                        // reverts if asset ∉ mandate; builds order (maker = vault), approves Aqua, ship()s
+function dockPool(bytes32 strategyHash) external onlyCurator;         // rebalance = dock + createPool
+function recycle(address asset, uint256 amount) external onlyCurator; // RWA inventory → RedemptionQueue.requestRedeem
+function fulfillRedeemEpoch(uint256 epoch) external onlyCurator;      // moves freed USDC to Claimable for LP exits
+```
+
+`totalAssets()` = idle USDC + shipped Aqua balances (`rawBalances`) + RWA inventory and queue
+positions at `NavOracle` value. LP exits settle at realized values through epochs (no
+oracle-priced instant exit), which closes the classic 4626 stale-price arbitrage. Pro makers are
+unaffected — both maker classes ship the same order templates to the same official router.
+
 ## 3. Build order
 
 1. **M1 (1inch qualification):** `NavOracle` → `ComplianceNFT` → `NavExtruction` (FixedSpread) →
@@ -133,7 +180,7 @@ token-level restrictions.
    real RWA through Pool 1.
 2. **M2:** `NavExtruction` DutchDecay + NavBand modes → `RedemptionQueue` → resting-bid flow
    (script only — a bid is just a small shipped strategy).
-3. **M3:** `RWAGateHook` → `OutletRouter` → Base Sepolia deploy (incl. official Aqua + router
-   redeploys) → `deployments/<chain>.json`.
+3. **M3:** `CuratorVault` (mandate + agent-as-curator wiring) → `RWAGateHook` → `OutletRouter` →
+   Base Sepolia deploy (incl. official Aqua + router redeploys) → `deployments/<chain>.json`.
 
 Offchain (separate repos/packages, not contracts): subgraph, curator agent, NAV keeper.

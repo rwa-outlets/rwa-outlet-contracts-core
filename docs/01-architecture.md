@@ -31,7 +31,7 @@ We keep the economics and replace the machinery with the hackathon stack:
 | Liquid Lane | RWA Outlets | Why |
 |---|---|---|
 | Offchain RFQ network of market makers | Deterministic onchain quotes from **SwapVM programs** (fixed spread / Dutch-decay auction / xyc AMM) | No offchain quoting infra; quotes are verifiable and fork-testable |
-| Shared curator vaults holding deposits | **Aqua virtual balances** — capital stays in maker wallets, one approval backs many strategies | Aqua is natively "shared collateral"; zero deposit/withdraw code |
+| Shared curator vaults holding deposits | **`CuratorVault`** — ERC-4626/7540 USDC vault (B2C: sync deposits, async LP exits) whose curator ships pooled capital into pool strategies under a per-vault **asset mandate**; pro makers can still ship their own wallets (B2B) | Same curated-deposit UX as Liquid Lane; Aqua virtual balances put both maker classes on one settlement rail |
 | Idle capital parked in Aave/Morpho | **Aqua capital reuse** — the same wallet balance concurrently backs both pools and any other Aqua strategy | Same "productive between redemptions" property, enforced by the registry |
 | Institutional curators | **AI curator agent** reasoning over our live subgraph, every decision logged with its query + entities | The Graph prize track |
 | Issuer-only settlement | Adds a **Uniswap v4 secondary lane** as price sanity check and fallback venue | Covers assets with real secondary markets |
@@ -55,8 +55,10 @@ How the components implement that loop:
 ```mermaid
 flowchart LR
   U[RWA holder] -->|instant exit| R[OutletRouter]
-  U -->|patient exit| Q[RedemptionQueue]
-  M[Makers / LPs<br/>capital stays in wallet] -->|"ship()"| AQ[(1inch Aqua<br/>virtual balances)]
+  U -->|patient exit| Q[RedemptionQueue<br/>ERC-7540 async vault]
+  LP[Retail LPs] -->|"deposit USDC (7540)"| CV[CuratorVault<br/>curator = AI agent,<br/>asset mandate]
+  CV -->|"ship()"| AQ[(1inch Aqua<br/>virtual balances)]
+  M[Pro makers<br/>capital stays in wallet] -->|"ship()"| AQ
 
   subgraph ENGINE[RWA Outlets engine]
     R --> VM[official 1inch SwapVM<br/>AquaSwapVMRouter, used as-is]
@@ -83,6 +85,13 @@ gives it to us for free. Fixed-rate quotes, decay auctions, and xyc AMM curves a
 programs drawing on the same shipped balance — custom pricing plugs in through the official
 `_extruction` opcode (`NavExtruction`), and KYC is a stock NFT balance-gate opcode.
 
+Capital reaches the pools from **two maker classes on the same rail**. Retail LPs deposit USDC
+into a `CuratorVault` (B2C — deposits are plain 4626, exits are async ERC-7540 epochs); its
+curator, here the AI agent, creates pools restricted to the vault's **asset mandate** (e.g.
+"T-bill funds only, discount floor ≤ 300 bps") and ships vault capital into them. Pro makers
+(B2B) skip the vault and ship their own wallet balances directly. Aqua treats both identically —
+contract makers work because shipped liquidity replaces signatures.
+
 ## 4. The pools — risk-tiered lanes over one shared capital base
 
 ### Pool 1 — Express (high-liquidity market)
@@ -108,10 +117,13 @@ dependency, so it keeps quoting between NAV updates and for oracle-less assets.
 
 ### Delayed exit — RedemptionQueue ("wait and take the profit")
 
-Holders who can wait deposit the RWA token into the queue, receive a **claim NFT**, and when the
-issuer settlement lands they are paid **full NAV including yield accrued while waiting**, minus a
-small queue fee. Makers use the same queue to recycle inventory bought at a discount — that
-NAV-minus-discount capture is the engine's profit motor.
+Holders who can wait open an **ERC-7540 redemption request** — the queue is an async redemption
+vault per asset (ERC-7575: the RWA token is the share, USDC the asset), the standard built for
+issuer-delayed RWA redemptions. When settlement lands their request turns Claimable and they are
+paid **full NAV including yield accrued while waiting**, minus a small queue fee — via the standard
+`redeem()` leg, or auto-claimed by the curator agent acting as their approved ERC-7540 operator.
+Makers use the same queue to recycle inventory bought at a discount — that NAV-minus-discount
+capture is the engine's profit motor.
 
 **Worked example** (rwaCREDIT, NAV 1.0432, 90-day issuer window, 5.3% APY):
 
@@ -131,6 +143,9 @@ the makers who fund instant exits.
    Aqua strategy simultaneously; utilization compounds instead of fragmenting.
 3. **NAV capture** — inventory acquired at a discount is pushed through the RedemptionQueue and
    settles at full NAV.
+
+Retail LPs collect all three passively: the `CuratorVault` share price accrues spreads, AMM fees,
+and NAV capture, net of curator and protocol fees.
 
 ## 6. Sponsor fit
 

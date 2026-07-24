@@ -16,7 +16,8 @@ allowed, never reimplementing it.
 | `Aqua` | — (official, deployed) | Shared virtual balances: `ship`/`dock` (liquidity), `pull`/`push` (swap-time settlement) |
 | `NavExtruction` | `IExtruction`, `IStaticExtruction` | Our custom instruction, plugged in via the stock `_extruction` opcode: NAV-anchored spread (Pool 1), Dutch decay (Pool 2), NAV band check (Pool 3); stale-NAV revert; emits `Trade` during swaps |
 | `ComplianceNFT` | ERC-721 (soulbound) | KYC pass: mint/revoke by operator; checked onchain by stock balance-gate opcodes and by `RWAGateHook` |
-| `RedemptionQueue` | ERC-721 | Escrows RWA tokens, mints claim NFTs, pays NAV on issuer settlement |
+| `RedemptionQueue` | ERC-7540 + ERC-7575 (redemption-only vault per asset) | Escrows redemption requests by issuer epoch (`share()` = the RWA token, `asset()` = USDC); settlement flips epochs Claimable; standard `redeem()` pays NAV |
+| `CuratorVault` | ERC-4626 + ERC-7540 (async redeem) | B2C USDC vault: sync deposits, epoch-fulfilled LP exits; the curator (AI agent) creates/docks pools under a per-vault **asset mandate** and recycles inventory through the queue |
 | `OutletRouter` | — | Single user entry point: best-of quoting across Pools 1–3 / resting bids / Uniswap, and queue deposits |
 | `NavOracle` | — | Per-asset NAV pushed by issuer keeper (demo: agent-updated), with staleness bounds |
 | `RWAGateHook` | v4 `BaseHook` | Uniswap v4 hook: transfer compliance + TWAP exposure for the secondary lane |
@@ -40,6 +41,9 @@ The official router is itself the Aqua app — no app contract of ours sits in t
   order. NAV movement does *not* require re-shipping — programs read NAV live via `NavExtruction`.
 - Taker side always calls `quote()` via `asView()` with the *same* takerData later passed to
   `swap()`, plus threshold and deadline.
+- A maker is either a **pro wallet** (B2B) or a **`CuratorVault`** pooling retail deposits (B2C,
+  §5) — identical from Aqua's perspective: `useAquaInsteadOfSignature` means no EOA signature, so a
+  contract maker works out of the box.
 
 ## 3. SwapVM programs (instruction order is security-critical)
 
@@ -98,7 +102,7 @@ quote/swap duals must return identical amounts, no backward jumps to it, contrac
 selected by args: fixed NAV spread, Dutch decay (exponential per-second factor, mirroring the
 official `DutchAuction` math, with hard floor and expiry), NAV band post-check. Reads `NavOracle`
 and reverts on staleness; in swap mode it also emits the `Trade` event with full pricing context
-(§6).
+(§7).
 
 ### KYC — a soulbound NFT, not a registry
 
@@ -118,30 +122,61 @@ the bid size — is a ring-fenced resting bid at a hand-picked discount, the clo
 Liquid Lane's RFQ bids. No signatures, no extra router; `OutletRouter` treats these as additional
 quote sources.
 
-## 4. RedemptionQueue (delayed lane)
+## 4. RedemptionQueue (delayed lane) — ERC-7540 + ERC-7575
 
-States: `Pending → SubmittedToIssuer → Settled → Claimed`.
+One **redemption-only async vault per RWA asset**, modeling the issuer delay with the standard
+lifecycle `Pending → Claimable → Claimed`. ERC-7575 shape: `share()` is the RWA token itself (an
+external share — the vault mints nothing), `asset()` is USDC. Deposit side disabled
+(`maxDeposit == 0`); ERC-7540 allows single-sided async vaults.
 
-- `enqueue(asset, amount)` escrows the RWA token, mints claim NFT with `(asset, amount, navAtEnqueue)`.
-- Curator agent batches `submitToIssuer(assetBatch)` per issuer window; issuer settlement delivers
-  USDC at `navAtSettle`.
-- `claim(id)` pays `amount × navAtSettle − queueFee`. Payouts come only from received settlement
-  cash, so the queue cannot be insolvent by construction.
+- `requestRedeem(shares, controller, owner)` escrows the RWA and emits the standard
+  `RedeemRequest`; `requestId` = the current **issuer batch epoch**, so all requests in a window
+  settle at the same NAV. Tracked by `pendingRedeemRequest(epoch, controller)`.
+- Curator agent calls `submitToIssuer(epoch)` per issuer window (still Pending).
+- `settle(epoch, navAtSettle)` (issuer keeper) pulls settlement USDC in and flips the epoch to
+  Claimable — the Claimable state is observable and never skipped, as the spec requires.
+- Claim is the standard 4626 leg: `redeem(shares, receiver, controller)` pays
+  `shares × navAtSettle − queueFee`, consuming claimable epochs FIFO.
+  `previewRedeem`/`previewWithdraw` revert (mandatory for async flows);
+  `maxRedeem(controller)` = claimable shares.
+- **Operator model = agent hook**: holders `setOperator(curatorAgent, true)` once and the agent
+  auto-claims when settlement lands — standard-conformant automation, logged for the Graph track.
+- Payouts come only from received settlement cash, so the queue cannot be insolvent by construction.
 - Spread waterfall on maker-recycled inventory: maker keeps the NAV−discount capture minus
   `curatorFeeBps` (agent treasury) and `protocolFeeBps`.
 
-## 5. Router + Uniswap lane
+## 5. CuratorVault (B2C capital) — ERC-4626 + ERC-7540
+
+Where retail capital enters: a USDC vault per curator mandate, mirroring Liquid Lane's curated
+deposit vaults. Deposits are synchronous 4626 (`deposit()` mints shares at the NAV-based share
+price); LP exits are asynchronous 7540 (`requestRedeem` → curator frees capital → epoch turns
+Claimable) — the same single-sided async pattern as the `RedemptionQueue`.
+
+- **Mandate** (immutable per vault): the set of RWA assets the vault may buy, per-asset caps,
+  maximum discount floor, fee split. `createPool(asset, poolType, params)` is curator-only and
+  reverts for out-of-mandate assets; it builds the pool order with `maker = vault`
+  (`NavExtruction` program per §3), approves Aqua, and `ship()`s vault USDC into the strategy.
+- **The curator is the AI agent.** Pool creation, rebalancing (dock + re-ship), recycling RWA
+  inventory bought at a discount into the `RedemptionQueue` (and auto-claiming at settlement via
+  the queue's operator model), and fulfilling LP exit epochs are all agent transactions — each
+  logged with its subgraph evidence for the Graph track.
+- **totalAssets** = idle USDC + shipped Aqua balances (`rawBalances`) + RWA inventory and queue
+  positions valued at `NavOracle` (staleness-bounded; deposits revert on stale NAV).
+- Both maker classes coexist on one rail: pro makers ship their own wallets, vaults ship pooled
+  deposits — the pools are the same order templates either way.
+
+## 6. Router + Uniswap lane
 
 `OutletRouter.redeemInstant(asset, amount, minOut)` quotes Pools 1–3, any isolated resting bids,
-and the Uniswap v4 RWA/USDC pool, then executes the best (or reverts to `enqueue` if the user chose
-patient mode). Because Pool 3 is two-sided, the router also exposes `buy(asset, usdcIn, minOut)` —
+and the Uniswap v4 RWA/USDC pool, then executes the best (or hands off to the queue's
+`requestRedeem` if the user chose patient mode). Because Pool 3 is two-sided, the router also exposes `buy(asset, usdcIn, minOut)` —
 entries route through the Market pool or Uniswap, whichever quotes better.
 Uniswap serves two jobs: **fallback venue** when Aqua inventory is thin, and **TWAP sanity bound** —
 program quotes deviating > `twapBandBps` from the v4 TWAP revert unless the NavOracle is fresher
 than the TWAP window. `RWAGateHook` enforces transfer compliance on the v4 pool, making the
 secondary lane a first-class integration alongside Aqua/SwapVM and the subgraph.
 
-## 6. Events → subgraph → agent (data flows one way)
+## 7. Events → subgraph → agent (data flows one way)
 
 Every state change emits full context — from the official contracts (Aqua, the SwapVM router) and
 from ours (`NavExtruction`, queue, oracle); the subgraph and UI see only events. Per
@@ -153,7 +188,8 @@ the same commit series.
 | `Trade(pool, asset, direction, maker, taker, amountIn, amountOut, rateVsNavBps)` — `NavExtruction` | `Trade` | Spread/volume monitoring, discount depth |
 | `Swapped(orderHash, maker, taker, tokenIn, tokenOut, amountIn, amountOut)` — official router | `Trade` | Pool 3 fills (no extruction context), AMM flow imbalance |
 | `Shipped/Docked/Pushed/Pulled(maker, app, strategyHash, token, amount)` — official Aqua | `MakerPosition` | Inventory + utilization per pool |
-| `Enqueued/Submitted/Settled/Claimed(id, asset, amount, nav)` — `RedemptionQueue` | `QueueTicket` | Backlog aging, settlement triggers |
+| `RedeemRequest(controller, owner, epoch, sender, shares)` + `Submitted/Settled/Withdraw` — `RedemptionQueue` (ERC-7540) | `RedeemRequest` | Backlog aging, settlement triggers |
+| `Deposit/Withdraw` + `RedeemRequest` + `PoolCreated/PoolDocked(strategyHash, asset)` — `CuratorVault` | `VaultPosition`, `Pool` | LP flows, share-price history, mandate utilization |
 | `NavUpdated(asset, nav, timestamp)` — `NavOracle` | `NavPoint` | Staleness alerts, rate anchoring |
 
 **Curator agent loop** (Graph track): query subgraph (utilization, discount clearing levels, queue
@@ -162,7 +198,7 @@ backlog, NAV staleness) → reason against policy (e.g. "Pool 2 clearing > 250 b
 it was based on, and the resulting transaction hash — that log is the query → reasoning → action
 demo evidence The Graph requires.
 
-## 7. Parameters (initial)
+## 8. Parameters (initial)
 
 | Param | Pool 1 Express | Pool 2 Patient | Pool 3 Market |
 |---|---|---|---|
@@ -176,7 +212,7 @@ Demo assets are real contracts deployed to Base Sepolia with live keeper-updated
 fixtures); the 1inch demo runs on a mainnet fork against real tokenized T-bill tokens and the
 official Aqua/SwapVM deployments.
 
-## 8. Invariants & risks
+## 9. Invariants & risks
 
 - `quote() == swap()` for identical takerData (tested with swap-vm `AquaOpcodesDebug`), including
   the `NavExtruction` static/state duals — the official Extruction contract requires deterministic,
@@ -186,15 +222,18 @@ official Aqua/SwapVM deployments.
 - Stale/manipulated NAV is the main oracle risk → hard staleness revert + Uniswap TWAP band.
 - Queue solvency is structural (pay only from received settlement); RWA depeg risk sits with makers
   who priced it, never with queue depositors.
+- `CuratorVault` share price depends on `NavOracle` → deposits revert on stale NAV; LP exits are
+  epoch-fulfilled at realized values (no oracle-priced instant exits), which closes the classic
+  4626 stale-price arbitrage.
 
-## 9. Milestones
+## 10. Milestones
 
 1. **M1** — Express pool end-to-end: `NavOracle` + `NavExtruction` (fixed-spread mode) +
    `ComplianceNFT`, fork test swapping a real RWA token through the **deployed** official
    Aqua + `AquaSwapVMRouter` (minimum 1inch qualification, runnable `script/Demo.s.sol`).
 2. **M2** — Patient pool (decay mode) + Market pool (xyc AMM + NAV band) + isolated resting bids +
-   `RedemptionQueue`.
-3. **M3** — `OutletRouter` + Uniswap v4 pool with `RWAGateHook` (TWAP band + fallback); Base
-   Sepolia deploy (`deployments/<chain>.json`).
+   `RedemptionQueue` (ERC-7540/7575).
+3. **M3** — `CuratorVault` (mandate + agent-as-curator) + `OutletRouter` + Uniswap v4 pool with
+   `RWAGateHook` (TWAP band + fallback); Base Sepolia deploy (`deployments/<chain>.json`).
 4. **M4** — Subgraph + curator agent with decision log.
 5. **M5** — Front, demo video (fork swap → agent loop → hook-gated v4 trade), README address table.
