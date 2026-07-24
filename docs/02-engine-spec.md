@@ -17,7 +17,7 @@ reimplementing it).
 | `OutletRouter` | — | Single user entry point: best-of quoting across Pool 1 / Pool 2 / Uniswap, and queue deposits |
 | `NavOracle` | — | Per-asset NAV pushed by issuer keeper (demo: agent-updated), with staleness bounds |
 | `ComplianceRegistry` | — | KYC'd maker allowlist (mirrors Liquid Lane's verified market makers); per-asset taker gating |
-| `RWAGateHook` | v4 `BaseHook` | (Stretch) Uniswap v4 hook: transfer compliance + TWAP exposure for the secondary lane |
+| `RWAGateHook` | v4 `BaseHook` | Uniswap v4 hook: transfer compliance + TWAP exposure for the secondary lane |
 
 ## 2. Aqua integration (shared capital base)
 
@@ -79,8 +79,8 @@ States: `Pending → SubmittedToIssuer → Settled → Claimed`.
 RWA/USDC pool, executes the best (or reverts to `enqueue` if the user chose patient mode).
 Uniswap serves two jobs: **fallback venue** when Aqua inventory is thin, and **TWAP sanity bound** —
 program quotes deviating > `twapBandBps` from the v4 TWAP revert unless the NavOracle is fresher
-than the TWAP window. `RWAGateHook` enforces transfer compliance on the v4 pool (stretch; a plain
-v3-style pool works as fallback-only).
+than the TWAP window. `RWAGateHook` enforces transfer compliance on the v4 pool, making the
+secondary lane a first-class integration alongside Aqua/SwapVM and the subgraph.
 
 ## 6. Events → subgraph → agent (data flows one way)
 
@@ -97,9 +97,9 @@ and UI see only events. Per `graph-contracts-sync`, any event/ABI change regener
 
 **Curator agent loop** (Graph track): query subgraph (utilization, discount clearing levels, queue
 backlog, NAV staleness) → reason against policy (e.g. "Pool 2 clearing > 250 bps for 6h → raise
-`floorRate`, ship more USDC") → act onchain. **Hedera track**: the agent pays keeper/settlement
-bounties on Hedera testnet via Agent Kit v4 (autonomous mode) and logs every decision + tx to an
-HCS topic — the audit trail doubles as demo evidence (hashscan links).
+`floorRate`, ship more USDC") → act onchain. Every decision is logged with the query, the entities
+it was based on, and the resulting transaction hash — that log is the query → reasoning → action
+demo evidence The Graph requires.
 
 ## 7. Parameters (initial)
 
@@ -129,6 +129,7 @@ official Aqua/SwapVM deployments.
 1. **M1** — `OutletApp` + Express program, fork test swapping a real RWA token through official
    Aqua/SwapVM (minimum 1inch qualification, runnable `script/Demo.s.sol`).
 2. **M2** — Patient pool (decay program) + custom opcodes (`OutletVM`) + `RedemptionQueue`.
-3. **M3** — `OutletRouter` + Uniswap fallback/TWAP; Base Sepolia deploy (`deployments/<chain>.json`).
-4. **M4** — Subgraph + curator agent + Hedera payments/HCS.
-5. **M5** — Front, demo video (fork swap → agent loop → Hedera payment), README address table.
+3. **M3** — `OutletRouter` + Uniswap v4 pool with `RWAGateHook` (TWAP band + fallback); Base
+   Sepolia deploy (`deployments/<chain>.json`).
+4. **M4** — Subgraph + curator agent with decision log.
+5. **M5** — Front, demo video (fork swap → agent loop → hook-gated v4 trade), README address table.

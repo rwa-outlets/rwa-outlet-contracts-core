@@ -4,7 +4,8 @@
 [Symbiotic Liquid Lane](https://symbiotic.fi/liquid-lane/) but rebuilt as a **1inch Aqua app with
 SwapVM programs**. Holders of tokenized RWAs exit to USDC in one transaction through risk-tiered
 pools, or queue for NAV settlement and keep the yield. A subgraph-driven AI curator agent manages
-the pools and pays operations on Hedera. Page 2 (`02-engine-spec.md`) is the contract-level spec.
+the pools, and a Uniswap v4 lane provides secondary-market pricing and fallback routing. Page 2
+(`02-engine-spec.md`) is the contract-level spec.
 
 ## 1. Problem
 
@@ -32,7 +33,7 @@ We keep the economics and replace the machinery with the hackathon stack:
 | Offchain RFQ network of market makers | Deterministic onchain quotes from **SwapVM programs** (fixed spread / Dutch-decay auction) | No offchain quoting infra; quotes are verifiable and fork-testable |
 | Shared curator vaults holding deposits | **Aqua virtual balances** — capital stays in maker wallets, one approval backs many strategies | Aqua is natively "shared collateral"; zero deposit/withdraw code |
 | Idle capital parked in Aave/Morpho | **Aqua capital reuse** — the same wallet balance concurrently backs both pools and any other Aqua strategy | Same "productive between redemptions" property, enforced by the registry |
-| Institutional curators | **AI curator agent** reasoning over our live subgraph; ops paid + audit-logged on Hedera | Graph + Hedera prize tracks |
+| Institutional curators | **AI curator agent** reasoning over our live subgraph, every decision logged with its query + entities | The Graph prize track |
 | Issuer-only settlement | Adds a **Uniswap v4 secondary lane** as price sanity check and fallback venue | Covers assets with real secondary markets |
 
 ## 3. System overview
@@ -57,7 +58,6 @@ flowchart LR
   R -.->|fallback + TWAP check| UNI[Uniswap v4 RWA/USDC]
   ENGINE -->|events| SG[Graph subgraph] --> AGENT[AI curator agent]
   AGENT -->|rebalance, trigger settlement| ENGINE
-  AGENT -->|ops payments + HCS log| HED[Hedera testnet]
 ```
 
 One `OutletApp` (an `AquaApp`), many **pools**. A pool is an Aqua *strategy* (`strategyHash`) with
@@ -110,6 +110,5 @@ the makers who fund instant exits.
 | Sponsor | What in this design qualifies |
 |---|---|
 | 1inch ($5k Aqua track) | `OutletApp` extends `AquaApp`; two SwapVM programs + a **custom opcode set** (NAV-anchored rate, compliance gate) — custom instructions are explicitly scored higher |
-| The Graph (Best AI Use Case) | Curator agent's decisions (rebalance, settle, widen spreads) come exclusively from our live subgraph |
-| Hedera (AI & Agentic Payments) | Agent pays keeper/settlement bounties on Hedera testnet; HCS topic is the decision audit trail |
-| Uniswap | v4 RWA/USDC pool as secondary lane: TWAP sanity check on program quotes + routing fallback |
+| The Graph (Best AI Use Case) | Curator agent's decisions (rebalance, settle, widen spreads) come exclusively from our live subgraph; the query → reasoning → action log is the demo evidence |
+| Uniswap | v4 RWA/USDC secondary lane built on a custom hook (`RWAGateHook`): compliance-gated transfers, TWAP sanity check on program quotes, router fallback venue |
