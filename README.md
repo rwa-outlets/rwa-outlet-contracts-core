@@ -60,7 +60,7 @@ treasuries) are currently the deployer and hand over to the agent/keeper via `se
 
 ```bash
 forge build          # two solc units: 0.8.30 (swap-vm/Aqua) + 0.8.26 (Uniswap v4)
-forge test           # 79 tests: unit, fuzz, and ERC-7540 invariant suites
+forge test           # 93 tests: unit, fuzz, and ERC-7540 invariant suites
 ```
 
 Tests run against the official Aqua + `AquaSwapVMRouter` deployed from the vendored 1inch
@@ -75,7 +75,28 @@ export AQUA=<aqua> SWAP_VM=<router>
 forge script script/Deploy.s.sol --rpc-url $RPC --mnemonics "$MNEMONIC" --sender $DEPLOYER --broadcast
 # 2. v4 hook (separate 0.8.26 unit, CREATE2-mined address):
 forge script script/DeployHook.s.sol --rpc-url $RPC --mnemonics "$MNEMONIC" --sender $DEPLOYER --broadcast
+# 3. v4 pools + venue: initializes both RWA/USDC pools at NAV with the hook, seeds demo
+#    liquidity, registers them on V4Venue, wires OutletRouter (fallback venue + TWAP guard):
+forge script script/SetupV4Pool.s.sol --rpc-url $RPC --mnemonics "$MNEMONIC" --sender $DEPLOYER --broadcast
 # (Sepolia used script/RewireFaucetTokens.s.sol to bind the stack to the faucet's live tokens.)
 ```
 
-Addresses are written to `deployments/<chainid>.json`.
+Addresses are written to `deployments/<chainid>.json` (v4 lane: `deployments/<chainid>.v4.json`).
+
+## Uniswap integration (hackathon judges — where to look)
+
+Onchain half of the Uniswap track ([frontend repo](https://github.com/rwa-outlets/frontend) holds
+the **Trading API** half + `FEEDBACK.md`):
+
+- [`src/RWAGateHook.sol`](src/RWAGateHook.sol) — custom v4 hook on the RWA/USDC pool:
+  `beforeSwap`/`beforeAddLiquidity` compliance gate over a soulbound KYC NFT (user forwarded via
+  `hookData`), `afterSwap` cumulative-price oracle with `twapRate(poolId, window)`.
+- [`src/V4Venue.sol`](src/V4Venue.sol) — v4 execution leg: per-asset pool registry, exact-in
+  quotes via the official `V4Quoter`, swaps settled in its own `unlockCallback`
+  (swap → settle input → take output straight to the user).
+- [`src/OutletRouter.sol`](src/OutletRouter.sol) — best-of routing: `quoteInstantAll`/`quoteBuyAll`
+  arbitrate our Aqua/SwapVM pools against the v4 pool; `redeemInstant`/`buy` execute the winner;
+  program quotes are sanity-bounded by the hook's TWAP (`_checkTwapBand`).
+- Tests: [`test/RWAGateHook.t.sol`](test/RWAGateHook.t.sol),
+  [`test/V4Venue.t.sol`](test/V4Venue.t.sol) (real `PoolManager` + `V4Quoter`),
+  router×v4 routing in [`test/OutletRouter.t.sol`](test/OutletRouter.t.sol).

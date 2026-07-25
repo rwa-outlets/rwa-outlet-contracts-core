@@ -24,6 +24,7 @@ the official deployed 1inch stack — we only build what plugs into it.**
 | 6 | `RWAGateHook` | v4 hook: compliance gate + TWAP | M3 | ~200 | v4-periphery `BaseHook`, `ComplianceNFT` |
 | 7 | `OutletRouter` | Best-of execution across pools / bids / v4 | M3 | ~300 | swap-vm `ISwapVM`, `RWAGateHook`, `RedemptionQueue` |
 | 8 | `CuratorVault` | USDC-only tier vault; curator runs pools across the tier's RWAs | M3 | ~350 | OZ ERC-4626, 7540 interfaces, `IAqua`, `NavOracle`, `RedemptionQueue` |
+| 9 | `V4Venue` | v4 execution leg: pool registry + quoter + unlock-callback swaps (router fallback venue) | M3 | ~200 | v4-core, v4-periphery `V4Quoter`, `RWAGateHook` |
 
 Everything else in the repo is scripts (`Deploy.s.sol`, `Demo.s.sol`, NAV keeper) and the test
 harness (fork tests against mainnet Aqua/router, quote==swap invariant suite reusing swap-vm's
@@ -140,10 +141,15 @@ function enqueue(address asset, uint256 amount) external returns (uint256 epoch)
 ```
 
 Quoting: `swapVM.asView().quote(...)` over registered strategies (same takerData reused for
-`swap()`), plus the v4 pool; executes the best venue. Enforces the TWAP band: program quotes
-deviating > `twapBandBps` from `RWAGateHook.twap()` revert unless `NavOracle` is fresher than the
-TWAP window. Gated assets rely on the program-level tx.origin NFT gate (§3 of the engine spec) plus
-token-level restrictions.
+`swap()`), plus the v4 pool through `V4Venue` (`quoteInstantAll`/`quoteBuyAll` — non-view since
+the official `V4Quoter` simulates via revert; call via `eth_call`); executes the best venue.
+Enforces the TWAP band: program quotes deviating > `twapBandBps` from `RWAGateHook.twap()` revert
+unless `NavOracle` is fresher than the TWAP window. Gated assets rely on the program-level
+tx.origin NFT gate (§3 of the engine spec) plus token-level restrictions. `V4Venue` (solc 0.8.26
+unit, reached through the pragma-neutral `IV4Venue`) registers one asset/USDC pool per RWA,
+forwards the real user as hookData for the compliance gate, and settles swaps in its own
+`unlockCallback` (swap → settle input → take output to the user); `script/SetupV4Pool.s.sol`
+initializes the pools at NAV, seeds demo liquidity, and wires the router.
 
 ### 2.8 `CuratorVault` (M3) — the B2C capital vault
 

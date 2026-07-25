@@ -9,6 +9,55 @@ import {OutletPrograms} from "../src/libraries/OutletPrograms.sol";
 import {OutletRouter} from "../src/OutletRouter.sol";
 import {RedemptionQueue} from "../src/RedemptionQueue.sol";
 import {IRwaTwapSource} from "../src/interfaces/IRwaTwapSource.sol";
+import {IV4Venue} from "../src/interfaces/IV4Venue.sol";
+
+/// @dev Stands in for the 0.8.26-unit V4Venue (covered by V4Venue.t.sol against the real
+///      PoolManager): fills at a configurable USDC-per-RWA rate from its own balances.
+contract MockV4Venue is IV4Venue {
+    IERC20 internal immutable RWA;
+    IERC20 internal immutable USDC;
+    uint256 internal constant RWA_SCALE = 1e30; // 10^(18 + 18 − 6)
+
+    uint256 public rate1e18; // USDC per RWA
+    bool public listed;
+
+    constructor(IERC20 rwa_, IERC20 usdc_) {
+        RWA = rwa_;
+        USDC = usdc_;
+    }
+
+    function set(uint256 rate1e18_, bool listed_) external {
+        rate1e18 = rate1e18_;
+        listed = listed_;
+    }
+
+    function poolIdOf(address) external view returns (bytes32) {
+        return listed ? bytes32(uint256(0xF00F)) : bytes32(0);
+    }
+
+    function quoteExactIn(address, bool assetForUsdc, uint256 amountIn, address)
+        public
+        view
+        returns (uint256)
+    {
+        return assetForUsdc ? (amountIn * rate1e18) / RWA_SCALE : (amountIn * RWA_SCALE) / rate1e18;
+    }
+
+    function swapExactIn(
+        address asset,
+        bool assetForUsdc,
+        uint256 amountIn,
+        uint256 minOut,
+        address recipient,
+        address user
+    ) external returns (uint256 out) {
+        out = quoteExactIn(asset, assetForUsdc, amountIn, user);
+        require(out >= minOut, "minOut");
+        (IERC20 tokenIn, IERC20 tokenOut) = assetForUsdc ? (RWA, USDC) : (USDC, RWA);
+        tokenIn.transferFrom(msg.sender, address(this), amountIn);
+        tokenOut.transfer(recipient, out);
+    }
+}
 
 contract MockTwapSource is IRwaTwapSource {
     uint256 public rate;
@@ -176,6 +225,98 @@ contract OutletRouterTest is OutletTestBase {
     function test_DuplicateListingReverts() public {
         vm.expectRevert(abi.encodeWithSelector(OutletRouter.AlreadyListed.selector, tightHash));
         router.registerStrategy(address(rwa), tightPool);
+    }
+
+    // ------------------------------------------------------------- v4 venue
+
+    function _wireV4(uint256 rate1e18) internal returns (MockV4Venue v4) {
+        v4 = new MockV4Venue(IERC20(address(rwa)), IERC20(address(usdc)));
+        usdc.mint(address(v4), 1_000_000e6);
+        rwa.mint(address(v4), 1_000_000e18);
+        v4.set(rate1e18, true);
+        router.setV4Venue(IV4Venue(address(v4)));
+    }
+
+    function test_V4WinsExit_whenAquaSpreadWider() public {
+        // pools quote NAV − 20 bps; v4 at flat NAV beats them
+        MockV4Venue v4 = _wireV4(NAV);
+        uint256 amount = 100e18;
+        uint256 v4Out = (amount * NAV) / RWA_SCALE;
+
+        (bytes32 bestHash, uint256 bestOut, bool viaV4) =
+            router.quoteInstantAll(address(rwa), amount, user);
+        assertTrue(viaV4, "v4 wins");
+        assertEq(bestHash, v4.poolIdOf(address(rwa)), "bestHash is the v4 poolId");
+        assertEq(bestOut, v4Out);
+
+        vm.prank(user);
+        uint256 out = router.redeemInstant(address(rwa), amount, v4Out);
+        assertEq(out, v4Out, "filled at the v4 rate");
+        assertEq(usdc.balanceOf(user), 1_000_000e6 + v4Out, "USDC straight to user");
+        assertEq(rwa.balanceOf(address(v4)), 1_000_000e18 + amount, "venue took the RWA");
+        assertEq(usdc.balanceOf(address(router)), 0, "no router residue");
+        assertEq(rwa.balanceOf(address(router)), 0);
+    }
+
+    function test_AquaWinsExit_whenV4Worse() public {
+        _wireV4((NAV * 95) / 100); // v4 5% below NAV loses to NAV − 20 bps
+
+        (bytes32 bestHash,, bool viaV4) = router.quoteInstantAll(address(rwa), 100e18, user);
+        assertFalse(viaV4, "Aqua wins");
+        assertEq(bestHash, tightHash);
+
+        (, uint256 aquaOut) = router.quoteInstant(address(rwa), 100e18);
+        vm.prank(user);
+        assertEq(router.redeemInstant(address(rwa), 100e18, aquaOut), aquaOut);
+    }
+
+    function test_V4WinsBuy_whenAquaAsksMore() public {
+        // pools sell RWA at NAV + 20 bps; v4 at flat NAV gives more RWA per USDC
+        MockV4Venue v4 = _wireV4(NAV);
+        uint256 usdcIn = 10_000e6;
+        uint256 v4Out = (usdcIn * RWA_SCALE) / NAV;
+
+        (,, bool viaV4) = router.quoteBuyAll(address(rwa), usdcIn, user);
+        assertTrue(viaV4, "v4 wins buys");
+
+        vm.prank(user);
+        uint256 out = router.buy(address(rwa), usdcIn, v4Out);
+        assertEq(out, v4Out);
+        assertEq(rwa.balanceOf(user), 1_000e18 + v4Out, "RWA straight to user");
+        assertEq(usdc.balanceOf(address(router)), 0);
+    }
+
+    function test_V4Unlisted_orBrokenQuote_isSkipped() public {
+        MockV4Venue v4 = _wireV4(NAV);
+
+        // delisted → poolIdOf is zero → skipped before quoting
+        v4.set(NAV, false);
+        (bytes32 bestHash,, bool viaV4) = router.quoteInstantAll(address(rwa), 100e18, user);
+        assertFalse(viaV4);
+        assertEq(bestHash, tightHash);
+
+        // listed but broken (rate 0 → division-by-zero revert) → quote caught, Aqua wins
+        v4.set(0, true);
+        (bestHash,, viaV4) = router.quoteInstantAll(address(rwa), 100e18, user);
+        assertFalse(viaV4);
+        assertEq(bestHash, tightHash);
+    }
+
+    function test_V4Fill_respectsTwapGuard() public {
+        MockV4Venue v4 = _wireV4(NAV);
+        router.setGuard(address(rwa), twap, bytes32("pool"), 300, 100); // 1% band
+
+        // TWAP 5% away, NAV stale for the guard window → even the v4 fill is blocked
+        // (absolute warps: via-IR caches TIMESTAMP within a function, see RWAGateHook.t.sol)
+        uint256 t0 = block.timestamp;
+        twap.set((NAV * 95) / 100, true);
+        vm.warp(t0 + 301);
+        oracle.setNav(address(rwa), NAV); // keep pools quotable
+        vm.warp(t0 + 602); // NAV older than the guard window again
+        vm.prank(user);
+        vm.expectRevert(); // QuoteOutsideTwapBand
+        router.redeemInstant(address(rwa), 10e18, 0);
+        assertEq(rwa.balanceOf(address(v4)), 1_000_000e18, "no fill happened");
     }
 
     // ------------------------------------------------------------ queue path

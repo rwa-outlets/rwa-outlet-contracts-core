@@ -13,12 +13,15 @@ import {TakerTraitsLib} from "swap-vm/src/libs/TakerTraits.sol";
 import {NavOracle} from "./NavOracle.sol";
 import {RedemptionQueue} from "./RedemptionQueue.sol";
 import {IRwaTwapSource} from "./interfaces/IRwaTwapSource.sol";
+import {IV4Venue} from "./interfaces/IV4Venue.sol";
 
-/// @title OutletRouter — best-of execution across outlet pools, resting bids, and the queue
+/// @title OutletRouter — best-of execution across outlet pools, resting bids, v4, and the queue
 /// @notice Single user entry point (docs/03-contracts.md §2.7). Holds no funds, only routes:
 ///         quotes every registered strategy for an asset through the official router's
-///         `asView().quote(...)`, enforces the Uniswap v4 TWAP sanity band, executes the best
-///         venue, and forwards patient exits to the asset's ERC-7540 RedemptionQueue.
+///         `asView().quote(...)` plus the Uniswap v4 RWA/USDC pool (fallback venue, via
+///         `V4Venue`), enforces the v4 TWAP sanity band, executes the best venue, and
+///         forwards patient exits to the asset's ERC-7540 RedemptionQueue. For v4 fills the
+///         `orderHash` in events is the v4 PoolId (see `V4Venue.PoolRegistered`).
 contract OutletRouter is Ownable {
     using SafeERC20 for IERC20;
 
@@ -46,7 +49,10 @@ contract OutletRouter is Ownable {
     mapping(bytes32 orderHash => address) public assetOf;
     mapping(address asset => RedemptionQueue) public queueOf;
     mapping(address asset => TwapGuard) public guardOf;
-    mapping(address token => bool) private _approved;
+    mapping(address token => mapping(address spender => bool)) private _approved;
+
+    /// @notice Uniswap v4 fallback venue (zero = v4 routing disabled).
+    IV4Venue public v4Venue;
 
     // ---------------------------------------------------------------- events
 
@@ -56,6 +62,7 @@ contract OutletRouter is Ownable {
     event StrategyDelisted(address indexed asset, bytes32 indexed orderHash);
     event QueueSet(address indexed asset, address queue);
     event GuardSet(address indexed asset, address source, bytes32 poolId, uint32 window, uint16 bandBps);
+    event V4VenueSet(address venue);
     event InstantExit(
         address indexed asset,
         address indexed user,
@@ -107,6 +114,11 @@ contract OutletRouter is Ownable {
         emit GuardSet(asset, address(source), poolId, window, bandBps);
     }
 
+    function setV4Venue(IV4Venue venue) external onlyOwner {
+        v4Venue = venue;
+        emit V4VenueSet(address(venue));
+    }
+
     // ------------------------------------------------------------- listings
 
     /// @notice Lists a pool strategy or resting bid so the router can quote it. Permissionless:
@@ -156,7 +168,8 @@ contract OutletRouter is Ownable {
 
     // ------------------------------------------------------------- quoting
 
-    /// @notice Best instant-exit quote (asset → USDC) across all listings.
+    /// @notice Best instant-exit quote (asset → USDC) across all Aqua listings. Excludes the
+    ///         v4 venue (its quoter is not view) — see `quoteInstantAll`.
     function quoteInstant(address asset, uint256 amount)
         public
         view
@@ -165,13 +178,52 @@ contract OutletRouter is Ownable {
         return _bestQuote(asset, address(USDC), asset, amount);
     }
 
-    /// @notice Best entry quote (USDC → asset) across all listings (two-sided Market pools).
+    /// @notice Best entry quote (USDC → asset) across all Aqua listings (two-sided Market
+    ///         pools). Excludes the v4 venue — see `quoteBuyAll`.
     function quoteBuy(address asset, uint256 usdcIn)
         public
         view
         returns (bytes32 bestHash, uint256 bestOut)
     {
         return _bestQuote(asset, asset, address(USDC), usdcIn);
+    }
+
+    /// @notice Best instant-exit quote including the Uniswap v4 fallback venue. Not view —
+    ///         the v4 quoter simulates the swap via revert — call offchain through eth_call.
+    ///         When v4 wins, `bestHash` is the v4 PoolId and `viaV4` is true.
+    /// @param user the account the v4 hook's compliance gate should check (the future taker)
+    function quoteInstantAll(address asset, uint256 amount, address user)
+        public
+        returns (bytes32 bestHash, uint256 bestOut, bool viaV4)
+    {
+        (bestHash, bestOut) = quoteInstant(asset, amount);
+        uint256 v4Out = _v4Quote(asset, true, amount, user);
+        if (v4Out > bestOut) (bestHash, bestOut, viaV4) = (v4Venue.poolIdOf(asset), v4Out, true);
+    }
+
+    /// @notice Best entry quote including the Uniswap v4 fallback venue (see quoteInstantAll).
+    function quoteBuyAll(address asset, uint256 usdcIn, address user)
+        public
+        returns (bytes32 bestHash, uint256 bestOut, bool viaV4)
+    {
+        (bestHash, bestOut) = quoteBuy(asset, usdcIn);
+        uint256 v4Out = _v4Quote(asset, false, usdcIn, user);
+        if (v4Out > bestOut) (bestHash, bestOut, viaV4) = (v4Venue.poolIdOf(asset), v4Out, true);
+    }
+
+    /// @dev Zero when the venue is unset, the asset has no registered pool, or the quote
+    ///      reverts (no liquidity, non-compliant user, …) — v4 simply doesn't bid.
+    function _v4Quote(address asset, bool assetForUsdc, uint256 amountIn, address user)
+        private
+        returns (uint256)
+    {
+        IV4Venue venue = v4Venue;
+        if (address(venue) == address(0) || venue.poolIdOf(asset) == bytes32(0)) return 0;
+        try venue.quoteExactIn(asset, assetForUsdc, amountIn, user) returns (uint256 out) {
+            return out;
+        } catch {
+            return 0;
+        }
     }
 
     function _bestQuote(address asset, address tokenOut, address tokenIn, uint256 amount)
@@ -199,44 +251,57 @@ contract OutletRouter is Ownable {
 
     // ------------------------------------------------------------ execution
 
-    /// @notice Instant exit: sells `amount` of `asset` for USDC at the best available quote.
+    /// @notice Instant exit: sells `amount` of `asset` for USDC at the best available quote
+    ///         across Aqua listings and the Uniswap v4 pool.
     function redeemInstant(address asset, uint256 amount, uint256 minOut)
         external
         returns (uint256 usdcOut)
     {
-        (bytes32 bestHash, uint256 bestOut) = quoteInstant(asset, amount);
+        (bytes32 bestHash, uint256 bestOut, bool viaV4) =
+            quoteInstantAll(asset, amount, msg.sender);
         if (bestHash == bytes32(0)) revert NoExecutableQuote(asset, amount);
         if (bestOut < minOut) revert InsufficientOutput(bestOut, minOut);
         _checkTwapBand(asset, Math.mulDiv(bestOut, _scale(asset), amount));
 
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
-        _ensureApproved(asset);
 
-        ISwapVM.Order memory order = abi.decode(orderBlobOf[bestHash], (ISwapVM.Order));
-        (, usdcOut,) = SWAP_VM.swap(
-            order, asset, address(USDC), amount, _takerData(minOut, msg.sender)
-        );
+        if (viaV4) {
+            _ensureApproved(asset, address(v4Venue));
+            usdcOut = v4Venue.swapExactIn(asset, true, amount, minOut, msg.sender, msg.sender);
+        } else {
+            _ensureApproved(asset, address(SWAP_VM));
+            ISwapVM.Order memory order = abi.decode(orderBlobOf[bestHash], (ISwapVM.Order));
+            (, usdcOut,) = SWAP_VM.swap(
+                order, asset, address(USDC), amount, _takerData(minOut, msg.sender)
+            );
+        }
 
         emit InstantExit(asset, msg.sender, bestHash, amount, usdcOut);
     }
 
-    /// @notice Entry: buys `asset` with `usdcIn` at the best available quote.
+    /// @notice Entry: buys `asset` with `usdcIn` at the best available quote across Aqua
+    ///         listings and the Uniswap v4 pool.
     function buy(address asset, uint256 usdcIn, uint256 minOut)
         external
         returns (uint256 assetOut)
     {
-        (bytes32 bestHash, uint256 bestOut) = quoteBuy(asset, usdcIn);
+        (bytes32 bestHash, uint256 bestOut, bool viaV4) = quoteBuyAll(asset, usdcIn, msg.sender);
         if (bestHash == bytes32(0)) revert NoExecutableQuote(asset, usdcIn);
         if (bestOut < minOut) revert InsufficientOutput(bestOut, minOut);
         _checkTwapBand(asset, Math.mulDiv(usdcIn, _scale(asset), bestOut));
 
         USDC.safeTransferFrom(msg.sender, address(this), usdcIn);
-        _ensureApproved(address(USDC));
 
-        ISwapVM.Order memory order = abi.decode(orderBlobOf[bestHash], (ISwapVM.Order));
-        (, assetOut,) = SWAP_VM.swap(
-            order, address(USDC), asset, usdcIn, _takerData(minOut, msg.sender)
-        );
+        if (viaV4) {
+            _ensureApproved(address(USDC), address(v4Venue));
+            assetOut = v4Venue.swapExactIn(asset, false, usdcIn, minOut, msg.sender, msg.sender);
+        } else {
+            _ensureApproved(address(USDC), address(SWAP_VM));
+            ISwapVM.Order memory order = abi.decode(orderBlobOf[bestHash], (ISwapVM.Order));
+            (, assetOut,) = SWAP_VM.swap(
+                order, address(USDC), asset, usdcIn, _takerData(minOut, msg.sender)
+            );
+        }
 
         emit Purchase(asset, msg.sender, bestHash, usdcIn, assetOut);
     }
@@ -302,10 +367,10 @@ contract OutletRouter is Ownable {
         );
     }
 
-    function _ensureApproved(address token) private {
-        if (!_approved[token]) {
-            IERC20(token).forceApprove(address(SWAP_VM), type(uint256).max);
-            _approved[token] = true;
+    function _ensureApproved(address token, address spender) private {
+        if (!_approved[token][spender]) {
+            IERC20(token).forceApprove(spender, type(uint256).max);
+            _approved[token][spender] = true;
         }
     }
 

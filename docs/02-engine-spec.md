@@ -21,6 +21,7 @@ allowed, never reimplementing it.
 | `OutletRouter` | — | Single user entry point: best-of quoting across Pools 1–3 / resting bids / Uniswap, and queue deposits |
 | `NavOracle` | — | Per-asset NAV pushed by issuer keeper (demo: agent-updated), with staleness bounds |
 | `RWAGateHook` | v4 `BaseHook` | Uniswap v4 hook: transfer compliance + TWAP exposure for the secondary lane |
+| `V4Venue` | `IUnlockCallback` | Uniswap v4 execution leg: per-asset RWA/USDC pool registry, exact-in quotes via the official `V4Quoter`, swaps settled through its own unlock callback; the router routes here when v4 beats every Aqua quote |
 
 ## 2. Aqua integration (shared capital base)
 
@@ -182,6 +183,15 @@ program quotes deviating > `twapBandBps` from the v4 TWAP revert unless the NavO
 than the TWAP window. `RWAGateHook` enforces transfer compliance on the v4 pool, making the
 secondary lane a first-class integration alongside Aqua/SwapVM and the subgraph.
 
+The v4 leg executes through **`V4Venue`** (solc 0.8.26 unit; the 0.8.30 router talks to it via
+the pragma-neutral `IV4Venue`, same pattern as `IRwaTwapSource`): pools are registered per asset
+(sorted asset/USDC pair + `RWAGateHook`), quotes come from the official `V4Quoter` (redeploy,
+non-view revert-simulation — `quoteInstantAll`/`quoteBuyAll` are therefore non-view, callable via
+`eth_call`), and fills run through the venue's own unlock callback (swap → settle input → take
+output straight to the user). The initiating user rides along as `hookData`, so the hook's
+compliance gate and TWAP observations see the real user. For v4 fills the router's
+`InstantExit`/`Purchase` events carry the v4 PoolId in the `orderHash` slot.
+
 ## 7. Events → subgraph → agent (data flows one way)
 
 Every state change emits full context — from the official contracts (Aqua, the SwapVM router) and
@@ -201,6 +211,7 @@ front's ABI transcriptions in the same commit series. The subgraph package lives
 | `InstantExit/Purchase/PatientEnqueued/StrategyRegistered/GuardSet` — `OutletRouter` | `RouterSwap`, `RouterListing`, `TwapGuard` | Venue routing stats, listing set |
 | `NavUpdated(asset, nav, timestamp)` — `NavOracle` | `Asset.nav`, `NavPoint` | Staleness alerts, rate anchoring |
 | `ObservationRecorded(poolId, sqrtPriceX96, rate1e18, cumulativeX128)` — `RWAGateHook` | `V4Pool`, `Observation` | Secondary-market price series, TWAP context |
+| `PoolRegistered(asset, poolId, fee, tickSpacing, hooks)` / `V4Swapped(asset, user, recipient, assetForUsdc, amountIn, amountOut)` — `V4Venue` | `V4Pool`, `RouterSwap` (venue = v4) | Maps PoolIds to assets; v4 fill volume vs Aqua fill volume |
 | `Transfer` — `ComplianceNFT` (soulbound) | `KycHolder` | The KYC set, onboarding |
 | `Transfer` — demo tokens | `TokenBalance` | Wallet/escrow balances (vault idle USDC, queue escrow) |
 

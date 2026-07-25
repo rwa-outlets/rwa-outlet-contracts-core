@@ -87,11 +87,11 @@ contract RWAGateHookTest is Test {
         // raw token1-per-token0 price: rate × 10^(d1 − d0), as a 2^192-scaled square
         uint256 rawX192;
         if (Currency.unwrap(key.currency1) == address(usdc)) {
-            // RWA is token0: raw = NAV × 10^(6-18) / 1e18
+            // RWA is token0: raw = NAV × 10^(6-18) / 1e18 = NAV / 1e30
             rawX192 = Math.mulDiv(NAV, 1 << 192, 1e30);
         } else {
-            // USDC is token0: raw = (1/NAV) × 10^(18-6) / 1e-... → 1e30 / NAV
-            rawX192 = Math.mulDiv(1e30, 1 << 192, NAV) / 1e18;
+            // USDC is token0: raw = (1/NAV) × 10^(18-6) × 1e18 = 1e30 / NAV
+            rawX192 = Math.mulDiv(1e30, 1 << 192, NAV);
         }
         return uint160(Math.sqrt(rawX192));
     }
