@@ -44,7 +44,7 @@ contract OutletRouterTest is OutletTestBase {
         router = new OutletRouter(ISwapVM(address(swapVM)), IERC20(address(usdc)), oracle);
         twap = new MockTwapSource();
         queue = new RedemptionQueue(
-            IERC20(address(rwa)), IERC20(address(usdc)), address(this), issuer, address(this), 5
+            IERC20(address(rwa)), IERC20(address(usdc)), address(this), issuer, address(this), 5, 0
         );
 
         tightPool = buildOrder(

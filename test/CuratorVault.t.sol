@@ -29,7 +29,7 @@ contract CuratorVaultTest is OutletTestBase {
         super.setUp();
         router = new OutletRouter(ISwapVM(address(swapVM)), IERC20(address(usdc)), oracle);
         queue = new RedemptionQueue(
-            IERC20(address(rwa)), IERC20(address(usdc)), address(this), issuer, treasury, 5
+            IERC20(address(rwa)), IERC20(address(usdc)), address(this), issuer, treasury, 5, 0
         );
 
         vault = new CuratorVault(

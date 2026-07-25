@@ -6,6 +6,7 @@ optimizer = true
 optimizer_runs = 200
 via_ir = true
 evm_version = "cancun"
+fs_permissions = [{ access = "read-write", path = "./deployments" }]
 # No solc pin: swap-vm/aqua require =0.8.30, Uniswap v4 requires =0.8.26.
 # Forge auto-detects per compilation unit; keep our sources' pragmas compatible.
 

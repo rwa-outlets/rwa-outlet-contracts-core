@@ -5,6 +5,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import {IERC7575} from "./interfaces/IERC7575.sol";
+import {IERC7540Operator, IERC7540Redeem} from "./interfaces/IERC7540.sol";
 
 /// @title RedemptionQueue — ERC-7540 + ERC-7575 async redemption-only vault, one per RWA asset
 /// @notice Ported from the validated `rwa-outlets-redemption_queue_simulation` prototype
@@ -17,7 +20,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 ///  - Lifecycle: Open (Pending) → submitToIssuer (still Pending) → settle (Claimable, pulls
 ///    settlement USDC in) → redeem (standard 4626 claim leg, FIFO epochs).
 ///  - Solvency is structural: claims pay only out of received settlement cash.
-contract RedemptionQueue is Ownable {
+contract RedemptionQueue is Ownable, IERC165, IERC7575, IERC7540Redeem {
     using SafeERC20 for IERC20;
 
     // ---------------------------------------------------------------- types
@@ -46,9 +49,13 @@ contract RedemptionQueue is Ownable {
     address public issuer; // delivers settlement cash
     address public feeRecipient; // queue-fee treasury
     uint16 public immutable queueFeeBps; // e.g. 5
+    // minimum submit → settle delay, enforced onchain. Production: the issuer window
+    // (e.g. 90 days for rwaCREDIT). Demos deploy a compressed timescale (e.g. 60 s = T+90).
+    uint256 public immutable issuerWindow;
 
     uint256 public currentEpoch = 1; // requests accumulate here
     uint256 public lastSettledEpoch; // epochs settle strictly in order
+    uint256 public lastSettledNav; // 1e18; exchange rate for the 4626 conversion views
     uint256 public accruedFees; // USDC owed to feeRecipient
 
     mapping(uint256 epoch => Epoch) private _epochs;
@@ -62,24 +69,8 @@ contract RedemptionQueue is Ownable {
 
     // ---------------------------------------------------------------- events
 
-    /// @dev ERC-7540 standard events
-    event RedeemRequest(
-        address indexed controller,
-        address indexed owner,
-        uint256 indexed requestId,
-        address sender,
-        uint256 shares
-    );
-    event OperatorSet(address indexed controller, address indexed operator, bool approved);
-    /// @dev ERC-4626 standard claim event
-    event Withdraw(
-        address indexed sender,
-        address indexed receiver,
-        address indexed controller,
-        uint256 assets,
-        uint256 shares
-    );
-    /// @dev ours
+    // The ERC-7540/4626 standard events (`RedeemRequest`, `OperatorSet`, `Withdraw`) are
+    // inherited from IERC7540Redeem / IERC7575. Ours:
     event Submitted(uint256 indexed epoch, uint256 totalShares);
     event Settled(uint256 indexed epoch, uint256 navAtSettle, uint256 assetsIn);
     event FeesClaimed(address indexed recipient, uint256 amount);
@@ -93,6 +84,7 @@ contract RedemptionQueue is Ownable {
     error EpochNotOpen(uint256 epoch);
     error EpochNotSubmitted(uint256 epoch);
     error EpochOutOfOrder(uint256 epoch, uint256 expected);
+    error IssuerWindowNotElapsed(uint256 epoch, uint256 readyAt);
     error ExceedsClaimable(uint256 requested, uint256 claimable);
     error AsyncFlowOnly(); // previews / sync deposits are forbidden by ERC-7540
 
@@ -104,7 +96,8 @@ contract RedemptionQueue is Ownable {
         address curator_,
         address issuer_,
         address feeRecipient_,
-        uint16 queueFeeBps_
+        uint16 queueFeeBps_,
+        uint256 issuerWindow_
     ) Ownable(msg.sender) {
         rwa = rwa_;
         usdc = usdc_;
@@ -112,9 +105,9 @@ contract RedemptionQueue is Ownable {
         issuer = issuer_;
         feeRecipient = feeRecipient_;
         queueFeeBps = queueFeeBps_;
+        issuerWindow = issuerWindow_;
         // shares (shareDecimals) × nav (1e18) → assets (assetDecimals)
-        _shareScale =
-            10 ** (IERC20Metadata(address(rwa_)).decimals() + 18 - IERC20Metadata(address(usdc_)).decimals());
+        _shareScale = 10 ** (IERC20Metadata(address(rwa_)).decimals() + 18 - IERC20Metadata(address(usdc_)).decimals());
     }
 
     // ------------------------------------------------------- ERC-7575 views
@@ -134,15 +127,32 @@ contract RedemptionQueue is Ownable {
         return usdc.balanceOf(address(this));
     }
 
+    /// @notice ERC-4626 conversion at the most recent settlement NAV — the vault has no
+    ///         exchange rate before the first settlement (returns 0). Excludes the queue
+    ///         fee per ERC-4626's "ignore fees" rule for convert functions; MUST NOT revert.
+    function convertToAssets(uint256 shares) external view returns (uint256 assets) {
+        return (shares * lastSettledNav) / _shareScale;
+    }
+
+    function convertToShares(uint256 assets) external view returns (uint256 shares) {
+        if (lastSettledNav == 0) return 0;
+        return (assets * _shareScale) / lastSettledNav;
+    }
+
+    /// @notice ERC-165: EIP-7540 requires async redemption vaults to acknowledge the
+    ///         operator (0xe3bc4e65), async-redeem (0x620ee8e4), and ERC-7575 (0x2f0a18c5)
+    ///         interface IDs (the test suite pins our interfaceIds to those constants).
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == type(IERC165).interfaceId || interfaceId == type(IERC7575).interfaceId
+            || interfaceId == type(IERC7540Operator).interfaceId || interfaceId == type(IERC7540Redeem).interfaceId;
+    }
+
     // ------------------------------------------------- ERC-7540 request leg
 
     /// @notice Escrows `shares` of the RWA and files them into the current issuer batch epoch.
     /// @dev `msg.sender` must be `owner` or an approved operator of `owner`.
     /// @return requestId The issuer batch epoch the request was filed into.
-    function requestRedeem(uint256 shares, address controller, address owner_)
-        external
-        returns (uint256 requestId)
-    {
+    function requestRedeem(uint256 shares, address controller, address owner_) external returns (uint256 requestId) {
         if (shares == 0) revert ZeroShares();
         if (msg.sender != owner_ && !isOperator[owner_][msg.sender]) revert NotAuthorized();
 
@@ -162,21 +172,13 @@ contract RedemptionQueue is Ownable {
     }
 
     /// @notice ERC-7540: shares requested but not yet claimable for `controller` in `requestId`.
-    function pendingRedeemRequest(uint256 requestId, address controller)
-        external
-        view
-        returns (uint256 shares)
-    {
+    function pendingRedeemRequest(uint256 requestId, address controller) external view returns (uint256 shares) {
         if (_epochs[requestId].state == EpochState.Settled) return 0;
         return sharesAt[requestId][controller];
     }
 
     /// @notice ERC-7540: shares claimable (settled, unclaimed) for `controller` in `requestId`.
-    function claimableRedeemRequest(uint256 requestId, address controller)
-        external
-        view
-        returns (uint256 shares)
-    {
+    function claimableRedeemRequest(uint256 requestId, address controller) external view returns (uint256 shares) {
         if (_epochs[requestId].state != EpochState.Settled) return 0;
         return sharesAt[requestId][controller];
     }
@@ -213,11 +215,14 @@ contract RedemptionQueue is Ownable {
         Epoch storage e = _epochs[epoch];
         if (e.state != EpochState.Submitted) revert EpochNotSubmitted(epoch);
         if (epoch != lastSettledEpoch + 1) revert EpochOutOfOrder(epoch, lastSettledEpoch + 1);
+        uint256 readyAt = e.submittedAt + issuerWindow;
+        if (block.timestamp < readyAt) revert IssuerWindowNotElapsed(epoch, readyAt);
 
         e.state = EpochState.Settled;
         e.navAtSettle = navAtSettle1e18;
         e.settledAt = block.timestamp;
         lastSettledEpoch = epoch;
+        lastSettledNav = navAtSettle1e18;
 
         // gross settlement cash, rounded up — structural solvency
         uint256 assetsIn = (e.totalShares * navAtSettle1e18 + _shareScale - 1) / _shareScale;
@@ -232,10 +237,7 @@ contract RedemptionQueue is Ownable {
 
     /// @notice Standard 4626 claim leg: pays `shares × navAtSettle − queueFee`, FIFO epochs.
     /// @dev `msg.sender` must be `controller` or an approved operator of `controller`.
-    function redeem(uint256 shares, address receiver, address controller)
-        external
-        returns (uint256 assets)
-    {
+    function redeem(uint256 shares, address receiver, address controller) external returns (uint256 assets) {
         if (shares == 0) revert ZeroShares();
         if (msg.sender != controller && !isOperator[controller][msg.sender]) {
             revert NotAuthorized();
@@ -284,7 +286,8 @@ contract RedemptionQueue is Ownable {
         }
     }
 
-    /// @notice Fee treasury withdrawal.
+    /// @notice Fee treasury withdrawal. Permissionless by design — proceeds always go to
+    ///         `feeRecipient`, so anyone may trigger the sweep.
     function claimFees() external {
         uint256 amount = accruedFees;
         accruedFees = 0;
@@ -319,12 +322,21 @@ contract RedemptionQueue is Ownable {
         revert AsyncFlowOnly();
     }
 
-    /// @dev ERC-7540: previews MUST revert for async flows.
+    /// @dev ERC-7540: previews MUST revert for async flows. The deposit-side previews also
+    ///      revert — allowed by ERC-4626 since `deposit`/`mint` themselves always revert.
     function previewRedeem(uint256) external pure returns (uint256) {
         revert AsyncFlowOnly();
     }
 
     function previewWithdraw(uint256) external pure returns (uint256) {
+        revert AsyncFlowOnly();
+    }
+
+    function previewDeposit(uint256) external pure returns (uint256) {
+        revert AsyncFlowOnly();
+    }
+
+    function previewMint(uint256) external pure returns (uint256) {
         revert AsyncFlowOnly();
     }
 
@@ -344,10 +356,7 @@ contract RedemptionQueue is Ownable {
 
     // -------------------------------------------------------------- admin
 
-    function setRoles(address curator_, address issuer_, address feeRecipient_)
-        external
-        onlyOwner
-    {
+    function setRoles(address curator_, address issuer_, address feeRecipient_) external onlyOwner {
         curator = curator_;
         issuer = issuer_;
         feeRecipient = feeRecipient_;
