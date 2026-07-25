@@ -185,18 +185,24 @@ secondary lane a first-class integration alongside Aqua/SwapVM and the subgraph.
 ## 7. Events → subgraph → agent (data flows one way)
 
 Every state change emits full context — from the official contracts (Aqua, the SwapVM router) and
-from ours (`NavExtruction`, queue, oracle); the subgraph and UI see only events. Per
-`graph-contracts-sync`, any event/ABI change regenerates `subgraph/abis` + `front/src/lib/abi` in
-the same commit series.
+from ours (`NavExtruction`, queue, vault, router, oracle, hook); the subgraph and UI see only
+events. Per `graph-contracts-sync`, any event/ABI change regenerates `subgraph/abis` + the
+front's ABI transcriptions in the same commit series. The subgraph package lives in
+`rwa-outlet-contracts-back/subgraph` (`npm run sync` pulls ABIs + addresses from this repo).
 
 | Event (emitter) | Subgraph entity | Agent uses it for |
 |---|---|---|
-| `Trade(pool, asset, direction, maker, taker, amountIn, amountOut, rateVsNavBps)` — `NavExtruction` | `Trade` | Spread/volume monitoring, discount depth |
-| `Swapped(orderHash, maker, taker, tokenIn, tokenOut, amountIn, amountOut)` — official router | `Trade` | Pool 3 fills (no extruction context), AMM flow imbalance |
-| `Shipped/Docked/Pushed/Pulled(maker, app, strategyHash, token, amount)` — official Aqua | `MakerPosition` | Inventory + utilization per pool |
-| `RedeemRequest(controller, owner, epoch, sender, shares)` + `Submitted/Settled/Withdraw` — `RedemptionQueue` (ERC-7540) | `RedeemRequest` | Backlog aging, settlement triggers |
-| `Deposit/Withdraw` + `RedeemRequest` + `PoolCreated/PoolDocked(strategyHash, asset)` — `CuratorVault` | `VaultPosition`, `Pool` | LP flows, share-price history, mandate utilization |
-| `NavUpdated(asset, nav, timestamp)` — `NavOracle` | `NavPoint` | Staleness alerts, rate anchoring |
+| `Trade(strategyHash, poolId, asset, isExit, maker, taker, amountIn, amountOut, rateVsNavBps)` — `NavExtruction` | `Trade` | Spread/volume monitoring, discount clearing depth |
+| `Swapped(orderHash, maker, taker, tokenIn, tokenOut, amountIn, amountOut)` — official router | `Fill` (linked to same-tx `Trade`) | Settlement-level fills, AMM flow imbalance |
+| `Shipped/Docked/Pushed/Pulled(maker, app, strategyHash, token, amount)` — official Aqua | `Strategy`, `StrategyBalance` | Inventory + utilization per pool |
+| `PoolCreated(strategyHash, asset, kind, amounts, params)/PoolDocked` — `CuratorVault` | `Strategy` (kind + decoded params) | Pool configuration, rebalance tracking |
+| `RedeemRequest/Submitted/Settled/Withdraw/RolesSet` — `RedemptionQueue` (ERC-7540) | `Queue`, `QueueEpoch`, `QueueRequest`, `QueueClaim` | Backlog aging, settlement triggers, FIFO claim state |
+| `Deposit/RedeemRequest/EpochFulfilled/Withdraw/Recycled/QueueClaimed/MandateAssetAdded` — `CuratorVault` | `Vault`, `VaultDeposit`, `VaultEpoch`, `VaultPosition`, `MandateAsset` | LP flows, share-price history, mandate utilization, recycling loop |
+| `InstantExit/Purchase/PatientEnqueued/StrategyRegistered/GuardSet` — `OutletRouter` | `RouterSwap`, `RouterListing`, `TwapGuard` | Venue routing stats, listing set |
+| `NavUpdated(asset, nav, timestamp)` — `NavOracle` | `Asset.nav`, `NavPoint` | Staleness alerts, rate anchoring |
+| `ObservationRecorded(poolId, sqrtPriceX96, rate1e18, cumulativeX128)` — `RWAGateHook` | `V4Pool`, `Observation` | Secondary-market price series, TWAP context |
+| `Transfer` — `ComplianceNFT` (soulbound) | `KycHolder` | The KYC set, onboarding |
+| `Transfer` — demo tokens | `TokenBalance` | Wallet/escrow balances (vault idle USDC, queue escrow) |
 
 **Curator agent loop** (Graph track): query subgraph (utilization, discount clearing levels, queue
 backlog, NAV staleness) → reason against policy (e.g. "Pool 2 clearing > 250 bps for 6h → raise

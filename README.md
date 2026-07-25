@@ -60,7 +60,7 @@ treasuries) are currently the deployer and hand over to the agent/keeper via `se
 
 ```bash
 forge build          # two solc units: 0.8.30 (swap-vm/Aqua) + 0.8.26 (Uniswap v4)
-forge test           # 77 tests: unit, fuzz, and ERC-7540 invariant suites
+forge test           # 79 tests: unit, fuzz, and ERC-7540 invariant suites
 ```
 
 Tests run against the official Aqua + `AquaSwapVMRouter` deployed from the vendored 1inch
