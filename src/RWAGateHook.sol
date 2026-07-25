@@ -61,7 +61,12 @@ contract RWAGateHook is IHooks {
 
     // ---------------------------------------------------------------- events
 
-    event ObservationRecorded(PoolId indexed poolId, uint160 sqrtPriceX96, uint256 cumulativeX128);
+    /// @param rate1e18 Spot USDC-per-RWA rate, decimals-normalized (0 when neither side is
+    ///        USDC — the hook is built for RWA/USDC pools; see `_toUsdcPerRwa1e18`). Gives the
+    ///        subgraph a ready-made secondary-market price series with no offchain Q64.96 math.
+    event ObservationRecorded(
+        PoolId indexed poolId, uint160 sqrtPriceX96, uint256 rate1e18, uint256 cumulativeX128
+    );
 
     // ---------------------------------------------------------------- errors
 
@@ -154,7 +159,11 @@ contract RWAGateHook is IHooks {
         }
         s.lastTimestamp = ts;
 
-        emit ObservationRecorded(id, sqrtPriceX96, s.cumulativeX128);
+        // normalized only for USDC pools so afterSwap can never revert on exotic pairs
+        uint256 rate1e18 = (s.currency0 == USDC || s.currency1 == USDC)
+            ? _toUsdcPerRwa1e18(s, _priceX128(sqrtPriceX96))
+            : 0;
+        emit ObservationRecorded(id, sqrtPriceX96, rate1e18, s.cumulativeX128);
         return (IHooks.afterSwap.selector, 0);
     }
 

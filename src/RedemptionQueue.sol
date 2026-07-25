@@ -74,6 +74,7 @@ contract RedemptionQueue is Ownable, IERC165, IERC7575, IERC7540Redeem {
     event Submitted(uint256 indexed epoch, uint256 totalShares);
     event Settled(uint256 indexed epoch, uint256 navAtSettle, uint256 assetsIn);
     event FeesClaimed(address indexed recipient, uint256 amount);
+    event RolesSet(address curator, address issuer, address feeRecipient);
 
     // ---------------------------------------------------------------- errors
 
@@ -360,5 +361,6 @@ contract RedemptionQueue is Ownable, IERC165, IERC7575, IERC7540Redeem {
         curator = curator_;
         issuer = issuer_;
         feeRecipient = feeRecipient_;
+        emit RolesSet(curator_, issuer_, feeRecipient_);
     }
 }

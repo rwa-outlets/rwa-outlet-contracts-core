@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
@@ -150,6 +150,28 @@ contract RWAGateHookTest is Test {
 
         // pool seeded at NAV; tiny swap moves price a little
         assertApproxEqRel(hook.lastRate(poolId), NAV, 0.02e18, "spot within 2% of NAV");
+    }
+
+    /// @dev The subgraph consumes `rate1e18` straight from the event — it must match the
+    ///      `lastRate()` view and sit at the pool price.
+    function test_ObservationRecorded_carriesNormalizedRate() public {
+        _addLiquidity(user);
+
+        vm.recordLogs();
+        _swap(user, true, _smallSwapAmount(true));
+
+        bytes32 sig = keccak256("ObservationRecorded(bytes32,uint160,uint256,uint256)");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool found;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != sig) continue;
+            assertEq(logs[i].topics[1], poolId, "poolId topic");
+            (, uint256 rate1e18,) = abi.decode(logs[i].data, (uint256, uint256, uint256));
+            assertEq(rate1e18, hook.lastRate(poolId), "event rate == lastRate()");
+            assertApproxEqRel(rate1e18, NAV, 0.02e18, "rate near NAV");
+            found = true;
+        }
+        assertTrue(found, "ObservationRecorded emitted");
     }
 
     function test_TwapOverWindow() public {

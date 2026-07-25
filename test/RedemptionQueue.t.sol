@@ -401,6 +401,22 @@ contract RedemptionQueueTest is Test {
         assertEq(queue.accruedFees(), 0);
     }
 
+    // -------------------------------------------------------------- admin
+
+    function test_setRoles_emitsRolesSet() public {
+        address newCurator = makeAddr("newCurator");
+        address newIssuer = makeAddr("newIssuer");
+        address newTreasury = makeAddr("newTreasury");
+
+        vm.expectEmit(address(queue));
+        emit RedemptionQueue.RolesSet(newCurator, newIssuer, newTreasury);
+        queue.setRoles(newCurator, newIssuer, newTreasury);
+
+        assertEq(queue.curator(), newCurator);
+        assertEq(queue.issuer(), newIssuer);
+        assertEq(queue.feeRecipient(), newTreasury);
+    }
+
     // --------------------------------------------------- multi-controller
 
     function test_multiController_sameEpoch() public {
