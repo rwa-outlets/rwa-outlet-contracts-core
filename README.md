@@ -30,8 +30,8 @@ Machine-readable copy: [`deployments/11155111.json`](deployments/11155111.json).
 | NavExtruction | [`0xFD8C2d242e82F7Ba28a2a038461C45481EA3849A`](https://sepolia.etherscan.io/address/0xFD8C2d242e82F7Ba28a2a038461C45481EA3849A) |
 | ComplianceNFT | [`0x82E0649Ec0783985FeB4201f126783bD4fC31031`](https://sepolia.etherscan.io/address/0x82E0649Ec0783985FeB4201f126783bD4fC31031) |
 | OutletRouter | [`0x9C352AE4df4853D25F2691c9183c336E0c112289`](https://sepolia.etherscan.io/address/0x9C352AE4df4853D25F2691c9183c336E0c112289) |
-| RedemptionQueue (rwaTBILL) | [`0xBf14ed0b9E2d3A167f9119082440A91C9C810472`](https://sepolia.etherscan.io/address/0xBf14ed0b9E2d3A167f9119082440A91C9C810472) |
-| RedemptionQueue (rwaCREDIT) | [`0xb12EE4D7f546C5B6Cb3EcC2b770B9b6780354502`](https://sepolia.etherscan.io/address/0xb12EE4D7f546C5B6Cb3EcC2b770B9b6780354502) |
+| RedemptionQueue (rwaTBILL) | [`0x782Ee6AA667022A90b5b5522781Ad19aA6C9eD2D`](https://sepolia.etherscan.io/address/0x782Ee6AA667022A90b5b5522781Ad19aA6C9eD2D) |
+| RedemptionQueue (rwaCREDIT) | [`0x8eCaFB95ff1E251A9198a766DbECD626bC1d6431`](https://sepolia.etherscan.io/address/0x8eCaFB95ff1E251A9198a766DbECD626bC1d6431) |
 | CuratorVault — Express tier (roEXP) | [`0x4AaAB2c212dA4d261E5F50F5A97B5d2d3892E204`](https://sepolia.etherscan.io/address/0x4AaAB2c212dA4d261E5F50F5A97B5d2d3892E204) |
 | CuratorVault — Patient tier (roPAT) | [`0x4C299f2cE2D07C77e8280a286241e0a30EaD9ae9`](https://sepolia.etherscan.io/address/0x4C299f2cE2D07C77e8280a286241e0a30EaD9ae9) |
 | RWAGateHook (Uniswap v4) | [`0x06Ae6eeAfC42d4Ca4158Bd3BddC4B14Cc54948C0`](https://sepolia.etherscan.io/address/0x06Ae6eeAfC42d4Ca4158Bd3BddC4B14Cc54948C0) |
