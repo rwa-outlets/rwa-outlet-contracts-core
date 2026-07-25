@@ -193,21 +193,21 @@ contract CuratorVault is ERC20, Ownable {
     }
 
     /// @notice Adds an RWA to the tier mandate with its redemption queue and shipping cap.
-    function addMandateAsset(address asset, RedemptionQueue queue, uint256 cap)
+    function addMandateAsset(address asset_, RedemptionQueue queue, uint256 cap)
         external
         onlyOwner
     {
-        if (!isMandateAsset[asset]) {
-            isMandateAsset[asset] = true;
-            mandateAssets.push(asset);
+        if (!isMandateAsset[asset_]) {
+            isMandateAsset[asset_] = true;
+            mandateAssets.push(asset_);
         }
-        queueOf[asset] = queue;
-        perAssetCap[asset] = cap;
-        IERC20(asset).forceApprove(address(AQUA), type(uint256).max);
+        queueOf[asset_] = queue;
+        perAssetCap[asset_] = cap;
+        IERC20(asset_).forceApprove(address(AQUA), type(uint256).max);
         if (address(queue) != address(0)) {
-            IERC20(asset).forceApprove(address(queue), type(uint256).max);
+            IERC20(asset_).forceApprove(address(queue), type(uint256).max);
         }
-        emit MandateAssetAdded(asset, address(queue), cap);
+        emit MandateAssetAdded(asset_, address(queue), cap);
     }
 
     // ------------------------------------------------------- ERC-7575 views

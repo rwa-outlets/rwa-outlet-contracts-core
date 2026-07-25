@@ -9,11 +9,13 @@ import {NavExtruction} from "../NavExtruction.sol";
 ///         are asserted against it in `test/OutletPrograms.t.sol` — if 1inch appends opcodes the
 ///         constants stay valid (their table is append-only for backward compatibility).
 library OutletPrograms {
-    uint8 internal constant OP_DEADLINE = 14;
-    uint8 internal constant OP_XYC_SWAP = 18;
-    uint8 internal constant OP_SALT = 21;
-    uint8 internal constant OP_EXTRUCTION = 33;
-    uint8 internal constant OP_ONLY_TX_ORIGIN_TOKEN_BALANCE_NON_ZERO = 34;
+    // NOTE: the official `_opcodes()` builder converts its static array to a dynamic one by
+    // overwriting slot 0 with the length, so real opcode indexes are source positions − 1.
+    uint8 internal constant OP_DEADLINE = 13;
+    uint8 internal constant OP_XYC_SWAP = 17;
+    uint8 internal constant OP_SALT = 20;
+    uint8 internal constant OP_EXTRUCTION = 32;
+    uint8 internal constant OP_ONLY_TX_ORIGIN_TOKEN_BALANCE_NON_ZERO = 33;
 
     error ArgsTooLong(uint256 length);
 

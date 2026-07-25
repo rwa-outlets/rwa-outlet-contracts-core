@@ -162,6 +162,8 @@ contract NavExtruction {
                 query.taker,
                 updatedSwap.amountIn,
                 updatedSwap.amountOut,
+                // rates are bounded by spread/band params, nowhere near int256 overflow
+                // forge-lint: disable-next-line(unsafe-typecast)
                 int256((implied1e18 * BPS) / nav) - int256(BPS)
             );
         }
