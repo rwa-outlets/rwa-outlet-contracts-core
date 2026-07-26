@@ -29,12 +29,30 @@ Machine-readable copy: [`deployments/11155111.json`](deployments/11155111.json).
 | NavOracle | [`0x49f587A7203C2CE7765CAcdD0D5bf912BF52a692`](https://sepolia.etherscan.io/address/0x49f587A7203C2CE7765CAcdD0D5bf912BF52a692) |
 | NavExtruction | [`0xFD8C2d242e82F7Ba28a2a038461C45481EA3849A`](https://sepolia.etherscan.io/address/0xFD8C2d242e82F7Ba28a2a038461C45481EA3849A) |
 | ComplianceNFT | [`0x82E0649Ec0783985FeB4201f126783bD4fC31031`](https://sepolia.etherscan.io/address/0x82E0649Ec0783985FeB4201f126783bD4fC31031) |
-| OutletRouter | [`0x9C352AE4df4853D25F2691c9183c336E0c112289`](https://sepolia.etherscan.io/address/0x9C352AE4df4853D25F2691c9183c336E0c112289) |
+| OutletRouter | [`0x139EAb630E311C278493b0B1fa392871d0c014BF`](https://sepolia.etherscan.io/address/0x139EAb630E311C278493b0B1fa392871d0c014BF) |
 | RedemptionQueue (rwaTBILL) | [`0x782Ee6AA667022A90b5b5522781Ad19aA6C9eD2D`](https://sepolia.etherscan.io/address/0x782Ee6AA667022A90b5b5522781Ad19aA6C9eD2D) |
 | RedemptionQueue (rwaCREDIT) | [`0x8eCaFB95ff1E251A9198a766DbECD626bC1d6431`](https://sepolia.etherscan.io/address/0x8eCaFB95ff1E251A9198a766DbECD626bC1d6431) |
 | CuratorVault — Express tier (roEXP) | [`0x4AaAB2c212dA4d261E5F50F5A97B5d2d3892E204`](https://sepolia.etherscan.io/address/0x4AaAB2c212dA4d261E5F50F5A97B5d2d3892E204) |
 | CuratorVault — Patient tier (roPAT) | [`0x4C299f2cE2D07C77e8280a286241e0a30EaD9ae9`](https://sepolia.etherscan.io/address/0x4C299f2cE2D07C77e8280a286241e0a30EaD9ae9) |
 | RWAGateHook (Uniswap v4) | [`0x06Ae6eeAfC42d4Ca4158Bd3BddC4B14Cc54948C0`](https://sepolia.etherscan.io/address/0x06Ae6eeAfC42d4Ca4158Bd3BddC4B14Cc54948C0) |
+
+### Uniswap v4 lane
+
+Machine-readable copy: [`deployments/11155111.v4.json`](deployments/11155111.v4.json). Both
+RWA/USDC pools (fee 3000, tick spacing 60, hook = RWAGateHook) are initialized at live NAV
+with full-range demo liquidity; the OutletRouter carries their TWAP guards (15 min window,
+100 bps band).
+
+| Contract | Address |
+|---|---|
+| V4Venue | [`0xf15b24dF29145A35E446e162e247102f5C77C0B4`](https://sepolia.etherscan.io/address/0xf15b24dF29145A35E446e162e247102f5C77C0B4) |
+| V4Quoter (official, redeployed) | [`0x98916b10a620b7Bc2911207932AE199C85513Dd1`](https://sepolia.etherscan.io/address/0x98916b10a620b7Bc2911207932AE199C85513Dd1) |
+| V4LpRouter (demo LP helper) | [`0x20aD784b3897735968C64b784aa68084ae870567`](https://sepolia.etherscan.io/address/0x20aD784b3897735968C64b784aa68084ae870567) |
+
+Pool IDs: rwaTBILL `0x48339bc61c57f8d92b59c94a5ca2e8f0955d8178be250cd7210b217fed867b97`,
+rwaCREDIT `0x3b929335bdb462d89381183305cc59a2915ff476684ad4b9b5e70afdf8423fce`.
+`script/run-v4-swaps.sh` pushes hook-gated swaps through both pools (seeds the
+`ObservationRecorded` TWAP series).
 
 ### Demo tokens & faucet
 
